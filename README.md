@@ -1,77 +1,77 @@
 # mt-docker
 
-Interactive installation script for [telemt-docker](https://github.com/An0nX/telemt-docker) MTProto proxy.
+Интерактивный скрипт установки MTProto-прокси [telemt-docker](https://github.com/An0nX/telemt-docker).
 
-## Quick start (one-liner)
+## Быстрый старт (одна команда)
 
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh)
 ```
 
-or with curl:
+или через curl:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh)
 ```
 
-The bootstrap script (`install.sh`) automatically:
-1. Detects distro (Debian/Ubuntu, CentOS/RHEL, Fedora)
-2. Installs system dependencies (openssl, curl, wget, ca-certificates, jq)
-3. Installs Docker CE + Compose plugin and enables/starts the daemon
-4. Downloads and runs the main `install-mtproto.sh`
+Загрузочный скрипт (`install.sh`) автоматически:
+1. Определяет дистрибутив (Debian/Ubuntu, CentOS/RHEL, Fedora)
+2. Устанавливает системные зависимости (openssl, curl, wget, ca-certificates, jq)
+3. Предлагает установить Docker CE + Compose plugin через официальный скрипт и запускает демон
+4. Скачивает и запускает основной скрипт `install-mtproto.sh`
 
-### Requirements
+### Требования
 
 - Linux (Debian/Ubuntu, CentOS/RHEL, Fedora)
-- Root access
+- Root-доступ
 
-> All other dependencies (Docker, OpenSSL, etc.) are installed automatically by the script.
+> Все остальные зависимости (Docker, OpenSSL и т.д.) устанавливаются автоматически.
 
-The script will interactively ask for:
+Скрипт интерактивно запрашивает:
 
-| Parameter | Description |
-|-----------|-------------|
-| Users | Usernames for `show_link` / `[access.users]`; a secret key is generated for each via `openssl rand -hex 16` |
-| Server port | Port the proxy listens on (default `443`) |
-| Announce IP | External IP of the server |
-| TLS domain | Domain for TLS masking (required, e.g. `example.com`) |
-| Host port | Docker port mapping on the host side |
-| Systemd service | Whether to create a systemd unit for auto-start |
-| Auto-update | Whether to enable a daily timer that pulls the latest image |
+| Параметр | Описание |
+|----------|----------|
+| Пользователи | Имена для `show_link` / `[access.users]`; для каждого генерируется секретный ключ через `openssl rand -hex 16` |
+| Порт сервера | Порт, на котором слушает прокси (по умолчанию `443`) |
+| Announce IP | Внешний IP-адрес сервера |
+| TLS-домен | Домен для TLS-маскировки (обязательный, например `example.com`) |
+| Порт хоста | Маппинг порта Docker на стороне хоста |
+| Systemd-служба | Создать systemd-юнит для автозапуска |
+| Авто-обновление | Включить ежедневный таймер обновления образа |
 
-## Generated files
+## Создаваемые файлы
 
-| File | Location |
-|------|----------|
+| Файл | Расположение |
+|------|--------------|
 | `telemt.toml` | `/opt/telemt/telemt.toml` |
 | `docker-compose.yml` | `/opt/telemt/docker-compose.yml` |
-| Systemd service | `/etc/systemd/system/telemt-compose.service` |
-| Update timer | `/etc/systemd/system/telemt-compose-update.timer` |
+| Systemd-служба | `/etc/systemd/system/telemt-compose.service` |
+| Таймер обновления | `/etc/systemd/system/telemt-compose-update.timer` |
 
-## Management
+## Управление
 
 ```bash
-# Service
+# Служба
 sudo systemctl start|stop|restart|status telemt-compose
 
-# Logs
+# Логи
 sudo docker compose -f /opt/telemt/docker-compose.yml logs -f
 
-# Manual image update
+# Ручное обновление образа
 sudo docker compose -f /opt/telemt/docker-compose.yml pull && \
 sudo docker compose -f /opt/telemt/docker-compose.yml up -d
 
-# Check auto-update timer
+# Проверить таймер авто-обновления
 sudo systemctl list-timers telemt-compose-update.timer
 ```
 
-## Uninstall
+## Удаление
 
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh) --uninstall
 ```
 
-or locally:
+или локально:
 
 ```bash
 sudo bash install-mtproto.sh --uninstall
