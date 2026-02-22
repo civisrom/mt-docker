@@ -2,17 +2,30 @@
 
 Interactive installation script for [telemt-docker](https://github.com/An0nX/telemt-docker) MTProto proxy.
 
-## Requirements
-
-- Linux (Debian/Ubuntu recommended)
-- Docker with Compose plugin (`docker compose`)
-- OpenSSL
-
-## Quick start
+## Quick start (one-liner)
 
 ```bash
-sudo bash install-mtproto.sh
+bash <(wget -qO- https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh)
 ```
+
+or with curl:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh)
+```
+
+The bootstrap script (`install.sh`) automatically:
+1. Detects distro (Debian/Ubuntu, CentOS/RHEL, Fedora)
+2. Installs system dependencies (openssl, curl, wget, ca-certificates, jq)
+3. Installs Docker CE + Compose plugin and enables/starts the daemon
+4. Downloads and runs the main `install-mtproto.sh`
+
+### Requirements
+
+- Linux (Debian/Ubuntu, CentOS/RHEL, Fedora)
+- Root access
+
+> All other dependencies (Docker, OpenSSL, etc.) are installed automatically by the script.
 
 The script will interactively ask for:
 
@@ -53,6 +66,12 @@ sudo systemctl list-timers telemt-compose-update.timer
 ```
 
 ## Uninstall
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh) --uninstall
+```
+
+or locally:
 
 ```bash
 sudo bash install-mtproto.sh --uninstall
