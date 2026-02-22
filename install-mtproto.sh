@@ -419,14 +419,17 @@ fi
 
 # ── pull image & start ─────────────────────────────────────────────────
 info "Pulling Docker image …"
-if ! docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" pull; then
+
+cd "${INSTALL_DIR}" || { err "Cannot cd to ${INSTALL_DIR}"; exit 1; }
+
+if ! docker compose pull; then
   err "Failed to pull Docker image. Check your internet connection."
   exit 1
 fi
 
 info "Starting container …"
-if ! docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" up -d; then
-  err "Failed to start container. Check config with: docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} config"
+if ! docker compose up -d; then
+  err "Failed to start container. Check config with: docker compose config"
   exit 1
 fi
 
