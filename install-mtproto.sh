@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# MTProto Proxy (telemt-docker) — installation script
-# Can be sourced from another script or run standalone.
+# MTProto Proxy (telemt-docker) — main configuration & deploy script
+# Called by install.sh (bootstrap) or can be run standalone.
 #
 # Usage:
 #   bash install-mtproto.sh              # interactive install
@@ -14,12 +14,15 @@ INSTALL_DIR="/opt/telemt"
 SERVICE_NAME="telemt-compose"
 COMPOSE_FILE="docker-compose.yml"
 CONFIG_FILE="telemt.toml"
-IMAGE="whn0thacked/telemt-docker:latest"
+SERVICE_FILE="${SERVICE_NAME}.service"
 UPDATER_TIMER="${SERVICE_NAME}-update"
+
+REPO_RAW="https://raw.githubusercontent.com/civisrom/mt-docker/main"
+CONFIG_URL="${REPO_RAW}/config"
 
 # ── colours / helpers ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 info()  { printf "${GREEN}[INFO]${NC}  %s\n" "$*"; }
 warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
@@ -33,9 +36,26 @@ need_root() {
   fi
 }
 
+# download helper: $1=url  $2=destination
+download() {
+  local url="$1" dest="$2"
+  if command -v wget &>/dev/null; then
+    wget -qO "$dest" "$url"
+  elif command -v curl &>/dev/null; then
+    curl -fsSL -o "$dest" "$url"
+  else
+    err "Neither wget nor curl found."
+    exit 1
+  fi
+  if [[ ! -s "$dest" ]]; then
+    err "Failed to download: $url"
+    exit 1
+  fi
+}
+
 check_deps() {
   local missing=()
-  for cmd in docker openssl; do
+  for cmd in docker openssl sed; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   if ! docker compose version &>/dev/null 2>&1; then
@@ -43,7 +63,7 @@ check_deps() {
   fi
   if (( ${#missing[@]} )); then
     err "Missing dependencies: ${missing[*]}"
-    err "Install them first, then re-run the script."
+    err "Run install.sh first, or install them manually."
     exit 1
   fi
 }
@@ -57,7 +77,7 @@ do_uninstall() {
   fi
 
   info "Removing systemd units …"
-  for u in "${SERVICE_NAME}.service" "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service"; do
+  for u in "${SERVICE_FILE}" "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service"; do
     systemctl disable --now "$u" 2>/dev/null || true
     rm -f "/etc/systemd/system/$u"
   done
@@ -87,7 +107,6 @@ while true; do
   read -r uname
   uname=$(echo "$uname" | xargs)           # trim
   [[ -z "$uname" ]] && break
-  # sanitise: only [a-zA-Z0-9_-]
   if [[ ! "$uname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     warn "Username may only contain letters, digits, '_' and '-'. Try again."
     continue
@@ -134,149 +153,60 @@ ask "Enable automatic daily image update? [Y/n]:"
 read -r AUTO_UPDATE
 AUTO_UPDATE=${AUTO_UPDATE:-Y}
 
-# ── generate files ──────────────────────────────────────────────────────
+# ── prepare install directory ───────────────────────────────────────────
 info "Creating ${INSTALL_DIR} …"
 mkdir -p "${INSTALL_DIR}"
 
-# --- telemt.toml ---
-info "Writing ${CONFIG_FILE} …"
+# ── download templates from repo config/ ───────────────────────────────
+info "Downloading template: ${CONFIG_FILE} …"
+download "${CONFIG_URL}/${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_FILE}"
 
-show_link_list=""
-users_block=""
+info "Downloading template: ${COMPOSE_FILE} …"
+download "${CONFIG_URL}/${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
+
+# ── patch telemt.toml ──────────────────────────────────────────────────
+info "Configuring ${CONFIG_FILE} …"
+
+# build show_link value: ["user1", "user2", ...]
+show_link_val=""
 for u in "${USERS[@]}"; do
-  show_link_list+="\"${u}\", "
-  users_block+="${u} = \"${SECRETS[$u]}\"\n"
+  show_link_val+="\"${u}\", "
 done
-# trim trailing ", "
-show_link_list="${show_link_list%, }"
+show_link_val="[${show_link_val%, }]"
 
-cat > "${INSTALL_DIR}/${CONFIG_FILE}" <<TOMLEOF
-show_link = [${show_link_list}]
+# build [access.users] block
+users_lines=""
+for u in "${USERS[@]}"; do
+  users_lines+="${u} = \"${SECRETS[$u]}\"\n"
+done
 
-[general]
-prefer_ipv6 = false
-fast_mode = true
-use_middle_proxy = false
+# apply values with sed
+sed -i "s|^show_link = .*|show_link = ${show_link_val}|" "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^port = .*|port = ${PORT}|"                    "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|" "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"   "${INSTALL_DIR}/${CONFIG_FILE}"
 
-[general.modes]
-classic = false
-secure = false
-tls = true
+# insert user lines after [access.users]
+sed -i "/^\[access\.users\]$/a\\
+$(printf "%b" "$users_lines")" "${INSTALL_DIR}/${CONFIG_FILE}"
 
-[server]
-port = ${PORT}
-listen_addr_ipv4 = "0.0.0.0"
-#listen_addr_ipv6 = "::"
-# metrics_port = 9090
-# metrics_whitelist = ["127.0.0.1", "::1"]
+# ── patch docker-compose.yml ──────────────────────────────────────────
+info "Configuring ${COMPOSE_FILE} …"
 
-[[server.listeners]]
-ip = "0.0.0.0"
-announce_ip = "${ANNOUNCE_IP}"
-
-[censorship]
-tls_domain = "${TLS_DOMAIN}"
-mask = true
-mask_port = 443
-fake_cert_len = 2048
-
-[access]
-replay_check_len = 65536
-ignore_time_skew = false
-
-[access.users]
-$(printf "%b" "$users_block")
-[[upstreams]]
-type = "direct"
-enabled = true
-weight = 10
-TOMLEOF
-
-# --- docker-compose.yml ---
-info "Writing ${COMPOSE_FILE} …"
-cat > "${INSTALL_DIR}/${COMPOSE_FILE}" <<YAMLEOF
-services:
-  telemt:
-    image: ${IMAGE}
-    container_name: telemt
-    restart: unless-stopped
-    environment:
-      RUST_LOG: "info"
-    volumes:
-      - ./${CONFIG_FILE}:/etc/telemt.toml:ro
-    ports:
-      - "${HOST_PORT}:${PORT}/tcp"
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=16m
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M
-YAMLEOF
+# replace port mapping line: "443:443/tcp" → "<HOST_PORT>:<PORT>/tcp"
+sed -i "s|\"443:443/tcp\"|\"${HOST_PORT}:${PORT}/tcp\"|" "${INSTALL_DIR}/${COMPOSE_FILE}"
 
 # ── systemd service ────────────────────────────────────────────────────
 if [[ "${CREATE_SERVICE,,}" =~ ^y ]]; then
-  info "Creating systemd service ${SERVICE_NAME}.service …"
-  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<SVCEOF
-[Unit]
-Description=Telemt MTProto Proxy (Docker Compose)
-Documentation=https://github.com/An0nX/telemt-docker
-Requires=docker.service
-After=docker.service network-online.target
-Wants=network-online.target
+  info "Downloading template: ${SERVICE_FILE} …"
+  download "${CONFIG_URL}/${SERVICE_FILE}" "/etc/systemd/system/${SERVICE_FILE}"
 
-[Service]
-Type=oneshot
-WorkingDirectory=${INSTALL_DIR}
-# Wait for Docker to be fully ready
-ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do docker info >/dev/null 2>&1 && break || sleep 3; done'
-# Validate docker-compose.yml configuration
-ExecStartPre=/usr/bin/docker compose config -q
-# Pull latest images before starting
-ExecStartPre=-/usr/bin/docker compose pull -q
-# Start containers
-ExecStart=/usr/bin/docker compose up -d --wait
-# Reload containers configuration
-ExecReload=/usr/bin/docker compose up -d --force-recreate
-# Stop containers
-ExecStop=/usr/bin/docker compose down
-# Show last 50 lines of logs after stop (for debugging)
-ExecStopPost=-/usr/bin/docker compose logs --tail=50
-# Keep service active after start
-RemainAfterExit=yes
-# Restart on failure
-Restart=on-failure
-RestartSec=30
-# Timeouts
-TimeoutStartSec=300
-TimeoutStopSec=120
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=${SERVICE_NAME}
-
-# Security hardening
-PrivateTmp=yes
-NoNewPrivileges=yes
-# Resource limits
-LimitNOFILE=65536
-LimitNPROC=512
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
+  # patch WorkingDirectory in case INSTALL_DIR differs from default
+  sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}|" "/etc/systemd/system/${SERVICE_FILE}"
 
   systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}.service"
-  info "Service enabled: ${SERVICE_NAME}.service"
+  systemctl enable "${SERVICE_FILE}"
+  info "Service enabled: ${SERVICE_FILE}"
 fi
 
 # ── auto-update timer ──────────────────────────────────────────────────

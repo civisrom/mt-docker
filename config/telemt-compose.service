@@ -1,0 +1,46 @@
+[Unit]
+Description=Telemt MTProto Proxy (Docker Compose)
+Documentation=https://github.com/An0nX/telemt-docker
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telemt
+# Wait for Docker to be fully ready
+ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do docker info >/dev/null 2>&1 && break || sleep 3; done'
+# Validate docker-compose.yml configuration
+ExecStartPre=/usr/bin/docker compose config -q
+# Pull latest images before starting
+ExecStartPre=-/usr/bin/docker compose pull -q
+# Start containers
+ExecStart=/usr/bin/docker compose up -d --wait
+# Reload containers configuration
+ExecReload=/usr/bin/docker compose up -d --force-recreate
+# Stop containers
+ExecStop=/usr/bin/docker compose down
+# Show last 50 lines of logs after stop (for debugging)
+ExecStopPost=-/usr/bin/docker compose logs --tail=50
+# Keep service active after start
+RemainAfterExit=yes
+# Restart on failure
+Restart=on-failure
+RestartSec=30
+# Timeouts
+TimeoutStartSec=300
+TimeoutStopSec=120
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telemt-compose
+
+# Security hardening
+PrivateTmp=yes
+NoNewPrivileges=yes
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

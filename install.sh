@@ -8,18 +8,19 @@
 # What it does:
 #   1. Detects distro (Debian/Ubuntu or RHEL/CentOS/Fedora)
 #   2. Installs system dependencies (openssl, curl, ca-certificates …)
-#   3. Installs Docker CE + Compose plugin and enables the daemon
+#   3. Offers to install Docker CE via official get.docker.com script
 #   4. Downloads and launches the main install-mtproto.sh
 #
 set -euo pipefail
 
 # ── colours / helpers ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 info()  { printf "${GREEN}[INFO]${NC}  %s\n" "$*"; }
 warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
 err()   { printf "${RED}[ERR]${NC}   %s\n" "$*" >&2; }
+ask()   { printf "${CYAN}[?]${NC}    %s " "$*"; }
 
 REPO_RAW="https://raw.githubusercontent.com/civisrom/mt-docker/main"
 
@@ -34,7 +35,6 @@ detect_distro() {
   if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     DISTRO_ID="${ID,,}"
-    DISTRO_LIKE="${ID_LIKE,,:-}"
   else
     err "Cannot detect distribution (/etc/os-release not found)."
     exit 1
@@ -59,7 +59,8 @@ install_packages() {
         gnupg \
         lsb-release \
         apt-transport-https \
-        jq
+        jq \
+        sed
       ;;
     centos|rhel|rocky|almalinux|ol)
       info "Installing dependencies (yum) …"
@@ -70,7 +71,8 @@ install_packages() {
         ca-certificates \
         gnupg2 \
         yum-utils \
-        jq
+        jq \
+        sed
       ;;
     fedora)
       info "Installing dependencies (dnf) …"
@@ -81,13 +83,14 @@ install_packages() {
         ca-certificates \
         gnupg2 \
         dnf-plugins-core \
-        jq
+        jq \
+        sed
       ;;
     *)
       warn "Unknown distro '${DISTRO_ID}'. Trying apt-get …"
       apt-get update -qq && apt-get install -y -qq \
-        openssl curl wget ca-certificates gnupg lsb-release jq || {
-        err "Could not install packages. Install manually: openssl curl wget ca-certificates jq"
+        openssl curl wget ca-certificates gnupg lsb-release jq sed || {
+        err "Could not install packages. Install manually: openssl curl wget ca-certificates jq sed"
         exit 1
       }
       ;;
@@ -97,69 +100,113 @@ install_packages() {
 
 install_packages
 
-# ── install Docker CE ──────────────────────────────────────────────────
-install_docker() {
-  if command -v docker &>/dev/null; then
-    info "Docker already installed: $(docker --version)"
+# ── Docker installation menu ──────────────────────────────────────────
+install_docker_menu() {
+  local docker_installed=false
+  local compose_installed=false
+
+  command -v docker &>/dev/null && docker_installed=true
+  docker compose version &>/dev/null 2>&1 && compose_installed=true
+
+  echo ""
+  printf "${BOLD}── Docker installation ──${NC}\n"
+  echo ""
+
+  if $docker_installed; then
+    info "Docker detected: $(docker --version)"
   else
-    info "Installing Docker CE via official script …"
-    curl -fsSL https://get.docker.com | sh
-    info "Docker installed: $(docker --version)"
+    warn "Docker is NOT installed."
   fi
 
-  # ensure daemon is running and enabled on boot
-  info "Enabling and starting Docker daemon …"
-  systemctl enable --now docker
-  # wait until docker responds
-  local retries=0
-  while ! docker info &>/dev/null; do
-    retries=$((retries + 1))
-    if (( retries > 15 )); then
-      err "Docker daemon did not start in time."
-      exit 1
-    fi
-    sleep 2
-  done
-  info "Docker daemon — running"
-}
-
-install_docker
-
-# ── verify Docker Compose plugin ──────────────────────────────────────
-verify_compose() {
-  if docker compose version &>/dev/null; then
-    info "Docker Compose plugin: $(docker compose version --short)"
+  if $compose_installed; then
+    info "Docker Compose detected: $(docker compose version --short)"
   else
-    warn "Docker Compose plugin not found, installing …"
-    case "${DISTRO_ID}" in
-      debian|ubuntu|linuxmint|pop)
-        apt-get install -y -qq docker-compose-plugin
-        ;;
-      centos|rhel|rocky|almalinux|ol)
-        yum install -y -q docker-compose-plugin
-        ;;
-      fedora)
-        dnf install -y -q docker-compose-plugin
-        ;;
-      *)
-        # fallback: install from GitHub
-        local compose_ver
-        compose_ver=$(curl -fsSL https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
-        curl -fsSL "https://github.com/docker/compose/releases/download/${compose_ver}/docker-compose-$(uname -s)-$(uname -m)" \
-          -o /usr/local/lib/docker/cli-plugins/docker-compose
-        chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-        ;;
-    esac
-    if docker compose version &>/dev/null; then
-      info "Docker Compose plugin installed: $(docker compose version --short)"
-    else
-      err "Failed to install Docker Compose plugin."
-      exit 1
-    fi
+    warn "Docker Compose plugin is NOT installed."
   fi
+
+  echo ""
+  printf "${BOLD}Choose an option:${NC}\n"
+  echo "  1) Install Docker CE + all components (official get.docker.com script)"
+  echo "  2) Skip Docker installation (already installed / will install manually)"
+  echo ""
+  ask "Your choice [1/2]:"
+  read -r docker_choice
+
+  case "${docker_choice}" in
+    1)
+      info "Installing Docker CE via official script (https://get.docker.com) …"
+      curl -fsSL https://get.docker.com | sh
+
+      info "Enabling and starting Docker daemon …"
+      systemctl enable --now docker
+
+      # wait until docker responds
+      local retries=0
+      while ! docker info &>/dev/null; do
+        retries=$((retries + 1))
+        if (( retries > 15 )); then
+          err "Docker daemon did not start in time."
+          exit 1
+        fi
+        sleep 2
+      done
+      info "Docker daemon — running"
+
+      # verify compose plugin came with the install
+      if ! docker compose version &>/dev/null 2>&1; then
+        warn "Compose plugin not found after Docker install, installing separately …"
+        case "${DISTRO_ID}" in
+          debian|ubuntu|linuxmint|pop)
+            apt-get install -y -qq docker-compose-plugin ;;
+          centos|rhel|rocky|almalinux|ol)
+            yum install -y -q docker-compose-plugin ;;
+          fedora)
+            dnf install -y -q docker-compose-plugin ;;
+          *)
+            err "Cannot install Compose plugin automatically for '${DISTRO_ID}'."
+            err "Install docker-compose-plugin manually and re-run."
+            exit 1 ;;
+        esac
+      fi
+
+      info "Docker CE: $(docker --version)"
+      info "Compose:   $(docker compose version --short)"
+      ;;
+    2)
+      info "Skipping Docker installation."
+      # verify what we need is actually present
+      if ! command -v docker &>/dev/null; then
+        err "Docker is not installed. Cannot continue."
+        exit 1
+      fi
+      if ! docker compose version &>/dev/null 2>&1; then
+        err "Docker Compose plugin is not installed. Cannot continue."
+        exit 1
+      fi
+      # ensure daemon is running
+      if ! docker info &>/dev/null 2>&1; then
+        warn "Docker daemon is not running, starting …"
+        systemctl enable --now docker
+        local retries=0
+        while ! docker info &>/dev/null; do
+          retries=$((retries + 1))
+          if (( retries > 15 )); then
+            err "Docker daemon did not start in time."
+            exit 1
+          fi
+          sleep 2
+        done
+      fi
+      info "Docker — OK"
+      ;;
+    *)
+      err "Invalid choice. Exiting."
+      exit 1
+      ;;
+  esac
 }
 
-verify_compose
+install_docker_menu
 
 # ── download & run main script ─────────────────────────────────────────
 MAIN_SCRIPT_URL="${REPO_RAW}/install-mtproto.sh"
