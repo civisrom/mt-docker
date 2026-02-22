@@ -34,7 +34,7 @@ The script will interactively ask for:
 | Users | Usernames for `show_link` / `[access.users]`; a secret key is generated for each via `openssl rand -hex 16` |
 | Server port | Port the proxy listens on (default `443`) |
 | Announce IP | External IP of the server |
-| TLS domain | Domain for TLS masking (default `online.<IP>.sslip.io`) |
+| TLS domain | Domain for TLS masking (required, e.g. `example.com`) |
 | Host port | Docker port mapping on the host side |
 | Systemd service | Whether to create a systemd unit for auto-start |
 | Auto-update | Whether to enable a daily timer that pulls the latest image |

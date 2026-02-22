@@ -134,9 +134,12 @@ if [[ -z "$ANNOUNCE_IP" ]]; then
   exit 1
 fi
 
-ask "TLS domain [online.${ANNOUNCE_IP}.sslip.io]:"
+ask "TLS domain (e.g. example.com):"
 read -r TLS_DOMAIN
-TLS_DOMAIN=${TLS_DOMAIN:-"online.${ANNOUNCE_IP}.sslip.io"}
+if [[ -z "$TLS_DOMAIN" ]]; then
+  err "tls_domain is required."
+  exit 1
+fi
 
 # --- docker port mapping ---
 ask "Host port to expose [${PORT}]:"
