@@ -44,6 +44,35 @@ detect_distro() {
 detect_distro
 info "Detected distro: ${DISTRO_ID}"
 
+# ── fast path: --uninstall (skip package install & Docker menu) ───────
+if [[ "${1:-}" == "--uninstall" ]]; then
+  info "Uninstall mode — skipping dependency and Docker installation."
+
+  MAIN_SCRIPT_URL="${REPO_RAW}/install-mtproto.sh"
+  TMP_SCRIPT=$(mktemp /tmp/install-mtproto.XXXXXX.sh)
+
+  if command -v wget &>/dev/null; then
+    wget -qO "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
+  elif command -v curl &>/dev/null; then
+    curl -fsSL -o "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
+  else
+    err "Neither wget nor curl found — cannot download uninstall script."
+    rm -f "${TMP_SCRIPT}"
+    exit 1
+  fi
+
+  if [[ ! -s "${TMP_SCRIPT}" ]]; then
+    err "Failed to download install-mtproto.sh"
+    rm -f "${TMP_SCRIPT}"
+    exit 1
+  fi
+
+  chmod +x "${TMP_SCRIPT}"
+  bash "${TMP_SCRIPT}" --uninstall
+  rm -f "${TMP_SCRIPT}"
+  exit 0
+fi
+
 # ── install system packages ────────────────────────────────────────────
 install_packages() {
   case "${DISTRO_ID}" in
@@ -105,8 +134,8 @@ install_docker_menu() {
   local docker_installed=false
   local compose_installed=false
 
-  command -v docker &>/dev/null && docker_installed=true
-  docker compose version &>/dev/null 2>&1 && compose_installed=true
+  if command -v docker &>/dev/null; then docker_installed=true; fi
+  if docker compose version &>/dev/null; then compose_installed=true; fi
 
   echo ""
   printf "${BOLD}── Docker installation ──${NC}\n"
@@ -153,7 +182,7 @@ install_docker_menu() {
       info "Docker daemon — running"
 
       # verify compose plugin came with the install
-      if ! docker compose version &>/dev/null 2>&1; then
+      if ! docker compose version &>/dev/null; then
         warn "Compose plugin not found after Docker install, installing separately …"
         case "${DISTRO_ID}" in
           debian|ubuntu|linuxmint|pop)
@@ -179,12 +208,12 @@ install_docker_menu() {
         err "Docker is not installed. Cannot continue."
         exit 1
       fi
-      if ! docker compose version &>/dev/null 2>&1; then
+      if ! docker compose version &>/dev/null; then
         err "Docker Compose plugin is not installed. Cannot continue."
         exit 1
       fi
       # ensure daemon is running
-      if ! docker info &>/dev/null 2>&1; then
+      if ! docker info &>/dev/null; then
         warn "Docker daemon is not running, starting …"
         systemctl enable --now docker
         local retries=0

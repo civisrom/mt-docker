@@ -58,7 +58,7 @@ check_deps() {
   for cmd in docker openssl sed; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
-  if ! docker compose version &>/dev/null 2>&1; then
+  if ! docker compose version &>/dev/null; then
     missing+=("docker-compose-plugin")
   fi
   if (( ${#missing[@]} )); then
@@ -89,7 +89,7 @@ do_uninstall() {
   exit 0
 }
 
-[[ "${1:-}" == "--uninstall" ]] && do_uninstall
+if [[ "${1:-}" == "--uninstall" ]]; then do_uninstall; fi
 
 # ── interactive config ──────────────────────────────────────────────────
 need_root
@@ -105,8 +105,9 @@ declare -A SECRETS=()
 while true; do
   ask "Enter username (or empty to finish):"
   read -r uname
-  uname=$(echo "$uname" | xargs)           # trim
-  [[ -z "$uname" ]] && break
+  uname="${uname#"${uname%%[![:space:]]*}"}" # trim leading
+  uname="${uname%"${uname##*[![:space:]]}"}" # trim trailing
+  if [[ -z "$uname" ]]; then break; fi
   if [[ ! "$uname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     warn "Username may only contain letters, digits, '_' and '-'. Try again."
     continue
@@ -126,11 +127,19 @@ fi
 ask "Server port [443]:"
 read -r PORT
 PORT=${PORT:-443}
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  err "Invalid port number: ${PORT} (must be 1–65535)."
+  exit 1
+fi
 
 ask "Announce IP (external IP of this server):"
 read -r ANNOUNCE_IP
 if [[ -z "$ANNOUNCE_IP" ]]; then
   err "announce_ip is required."
+  exit 1
+fi
+if [[ "$ANNOUNCE_IP" == *"|"* || "$ANNOUNCE_IP" == *"&"* ]]; then
+  err "Invalid characters in announce_ip."
   exit 1
 fi
 
@@ -140,11 +149,19 @@ if [[ -z "$TLS_DOMAIN" ]]; then
   err "tls_domain is required."
   exit 1
 fi
+if [[ "$TLS_DOMAIN" == *"|"* || "$TLS_DOMAIN" == *"&"* ]]; then
+  err "Invalid characters in tls_domain."
+  exit 1
+fi
 
 # --- docker port mapping ---
 ask "Host port to expose [${PORT}]:"
 read -r HOST_PORT
 HOST_PORT=${HOST_PORT:-$PORT}
+if ! [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || (( HOST_PORT < 1 || HOST_PORT > 65535 )); then
+  err "Invalid host port: ${HOST_PORT} (must be 1–65535)."
+  exit 1
+fi
 
 # --- systemd service ---
 ask "Create systemd service for auto-start? [Y/n]:"
@@ -177,10 +194,10 @@ for u in "${USERS[@]}"; do
 done
 show_link_val="[${show_link_val%, }]"
 
-# build [access.users] block
-users_lines=""
+# build [access.users] block into a temp file (avoids sed quoting issues)
+users_tmp=$(mktemp)
 for u in "${USERS[@]}"; do
-  users_lines+="${u} = \"${SECRETS[$u]}\"\n"
+  echo "${u} = \"${SECRETS[$u]}\"" >> "$users_tmp"
 done
 
 # apply values with sed
@@ -189,9 +206,9 @@ sed -i "s|^port = .*|port = ${PORT}|"                    "${INSTALL_DIR}/${CONFI
 sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|" "${INSTALL_DIR}/${CONFIG_FILE}"
 sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"   "${INSTALL_DIR}/${CONFIG_FILE}"
 
-# insert user lines after [access.users]
-sed -i "/^\[access\.users\]$/a\\
-$(printf "%b" "$users_lines")" "${INSTALL_DIR}/${CONFIG_FILE}"
+# insert user lines after [access.users] using 'r' (read file) command
+sed -i "/^\[access\.users\]$/r ${users_tmp}" "${INSTALL_DIR}/${CONFIG_FILE}"
+rm -f "$users_tmp"
 
 # ── patch docker-compose.yml ──────────────────────────────────────────
 info "Configuring ${COMPOSE_FILE} …"
@@ -254,10 +271,16 @@ fi
 
 # ── pull image & start ─────────────────────────────────────────────────
 info "Pulling Docker image …"
-docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" pull
+if ! docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" pull; then
+  err "Failed to pull Docker image. Check your internet connection."
+  exit 1
+fi
 
 info "Starting container …"
-docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" up -d
+if ! docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" up -d; then
+  err "Failed to start container. Check config with: docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} config"
+  exit 1
+fi
 
 # ── summary ─────────────────────────────────────────────────────────────
 echo ""
