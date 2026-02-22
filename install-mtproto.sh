@@ -68,23 +68,124 @@ check_deps() {
   fi
 }
 
-# ── uninstall ───────────────────────────────────────────────────────────
-do_uninstall() {
-  need_root
-  info "Stopping containers …"
-  if [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
-    docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
+# ── detect existing installation ──────────────────────────────────────
+# Searches for install dirs in: default path, systemd service files,
+# running/stopped containers, and docker images.
+# Sets: FOUND_DIRS (array), FOUND_CONTAINER (bool), FOUND_IMAGE (bool)
+detect_existing_install() {
+  FOUND_DIRS=()
+  FOUND_CONTAINER=false
+  FOUND_IMAGE=false
+
+  # helper: add dir to FOUND_DIRS if not already present
+  _add_dir() {
+    local d="$1"
+    if [[ -z "$d" || ! -d "$d" ]]; then return; fi
+    local existing
+    for existing in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
+      if [[ "$existing" == "$d" ]]; then return; fi
+    done
+    FOUND_DIRS+=("$d")
+  }
+
+  # 1. Default install directory
+  _add_dir "${INSTALL_DIR}"
+
+  # 2. WorkingDirectory from systemd service files
+  local svc_path
+  for svc_path in \
+    "/etc/systemd/system/${SERVICE_FILE}" \
+    "/etc/systemd/system/${UPDATER_TIMER}.service"
+  do
+    if [[ -f "$svc_path" ]]; then
+      local wd
+      wd=$(grep '^WorkingDirectory=' "$svc_path" 2>/dev/null | cut -d= -f2- || true)
+      _add_dir "$wd"
+    fi
+  done
+
+  # 3. Check for telemt container (running or stopped)
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'telemt'; then
+    FOUND_CONTAINER=true
   fi
 
+  # 4. Check for telemt docker image
+  if docker images --format '{{.Repository}}' 2>/dev/null | grep -qx 'whn0thacked/telemt-docker'; then
+    FOUND_IMAGE=true
+  fi
+
+  # Return 0 if anything was found
+  if (( ${#FOUND_DIRS[@]} > 0 )) || $FOUND_CONTAINER || $FOUND_IMAGE; then
+    return 0
+  fi
+  return 1
+}
+
+# ── cleanup existing installation (targeted — telemt only) ────────────
+cleanup_existing_install() {
+  echo ""
+  info "── Removing existing telemt MTProto installation ──"
+
+  # 1. Stop containers via compose (for each found install dir)
+  local dir
+  for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
+    if [[ -f "${dir}/${COMPOSE_FILE}" ]]; then
+      info "Stopping containers (${dir}/${COMPOSE_FILE}) …"
+      docker compose -f "${dir}/${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
+    fi
+  done
+
+  # 2. Force-remove container 'telemt' if still present
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'telemt'; then
+    info "Force-removing container 'telemt' …"
+    docker rm -f telemt 2>/dev/null || true
+  fi
+
+  # 3. Remove only telemt docker images (all tags)
+  local telemt_image_ids
+  telemt_image_ids=$(docker images --format '{{.ID}}' --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null || true)
+  if [[ -n "$telemt_image_ids" ]]; then
+    info "Removing telemt Docker images …"
+    local img_id
+    while IFS= read -r img_id; do
+      docker rmi -f "$img_id" 2>/dev/null || true
+    done <<< "$telemt_image_ids"
+  fi
+
+  # 4. Disable and remove systemd units
   info "Removing systemd units …"
+  local u
   for u in "${SERVICE_FILE}" "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service"; do
-    systemctl disable --now "$u" 2>/dev/null || true
-    rm -f "/etc/systemd/system/$u"
+    if [[ -f "/etc/systemd/system/$u" ]]; then
+      systemctl disable --now "$u" 2>/dev/null || true
+      rm -f "/etc/systemd/system/$u"
+      info "  removed: $u"
+    fi
   done
   systemctl daemon-reload 2>/dev/null || true
 
-  info "Removing ${INSTALL_DIR} …"
-  rm -rf "${INSTALL_DIR}"
+  # 5. Remove install directories and their config files
+  for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
+    if [[ -d "$dir" ]]; then
+      info "Removing directory: ${dir} …"
+      rm -rf "$dir"
+    fi
+  done
+
+  info "── Cleanup complete ──"
+  echo ""
+}
+
+# ── uninstall (--uninstall flag) ──────────────────────────────────────
+do_uninstall() {
+  need_root
+
+  if detect_existing_install; then
+    cleanup_existing_install
+  else
+    warn "No existing telemt installation found."
+  fi
+
   info "Uninstall complete."
   exit 0
 }
@@ -97,6 +198,53 @@ check_deps
 
 info "=== MTProto Proxy (telemt) installer ==="
 echo ""
+
+# ── detect & offer to remove previous installation ───────────────────
+if detect_existing_install; then
+  echo ""
+  printf "${BOLD}── Existing telemt installation detected ──${NC}\n"
+
+  # show what was found
+  for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
+    info "  Install directory : ${dir}"
+    if [[ -f "${dir}/${CONFIG_FILE}" ]]; then
+      info "    config          : ${dir}/${CONFIG_FILE}"
+    fi
+    if [[ -f "${dir}/${COMPOSE_FILE}" ]]; then
+      info "    compose         : ${dir}/${COMPOSE_FILE}"
+    fi
+  done
+  if $FOUND_CONTAINER; then
+    cstate=$(docker inspect -f '{{.State.Status}}' telemt 2>/dev/null || echo "unknown")
+    info "  Container 'telemt': ${cstate}"
+  fi
+  if $FOUND_IMAGE; then
+    itag=$(docker images --format '{{.Repository}}:{{.Tag}}  ({{.Size}})' --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null | head -1 || echo "present")
+    info "  Image             : ${itag}"
+  fi
+
+  echo ""
+  printf "${BOLD}Choose an option:${NC}\n"
+  echo "  1) Remove existing installation completely and install fresh"
+  echo "  2) Cancel installation"
+  echo ""
+  ask "Your choice [1/2]:"
+  read -r reinstall_choice
+
+  case "${reinstall_choice}" in
+    1)
+      cleanup_existing_install
+      ;;
+    2)
+      info "Installation cancelled."
+      exit 0
+      ;;
+    *)
+      err "Invalid choice. Exiting."
+      exit 1
+      ;;
+  esac
+fi
 
 # --- users ---
 declare -a USERS=()
