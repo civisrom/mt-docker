@@ -1,0 +1,39 @@
+show_link = []
+
+[general]
+prefer_ipv6 = false
+fast_mode = true
+use_middle_proxy = false
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[server]
+port = 443
+listen_addr_ipv4 = "0.0.0.0"
+#listen_addr_ipv6 = "::"
+# metrics_port = 9090
+# metrics_whitelist = ["127.0.0.1", "::1"]
+
+[[server.listeners]]
+ip = "0.0.0.0"
+announce_ip = "0.0.0.0"
+
+[censorship]
+tls_domain = "example.com"
+mask = true
+mask_port = 443
+fake_cert_len = 2048
+
+[access]
+replay_check_len = 65536
+ignore_time_skew = false
+
+[access.users]
+
+[[upstreams]]
+type = "direct"
+enabled = true
+weight = 10
