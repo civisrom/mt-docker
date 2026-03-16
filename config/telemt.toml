@@ -14,7 +14,7 @@ tls = true
 # В host mode это реальный порт на хосте.
 # 443 занят nginx — используем 4443.
 # Клиенты (relay-серверы) должны подключаться на этот порт.
-port = 4443
+port = 443
 listen_addr_ipv4 = "0.0.0.0"
 #listen_addr_ipv6 = "::"
 # metrics_port = 9090
