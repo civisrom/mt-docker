@@ -56,7 +56,7 @@ download() {
 
 check_deps() {
   local missing=()
-  for cmd in docker openssl sed; do
+  for cmd in docker openssl sed xxd; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   if ! docker compose version &>/dev/null; then
@@ -616,10 +616,14 @@ echo ""
 # ── proxy links ────────────────────────────────────────────────────────
 info "Users & proxy links:"
 echo ""
+
+# Hex-encode TLS domain for fake-TLS secret (ee prefix)
+domain_hex=$(printf '%s' "${TLS_DOMAIN}" | xxd -p | tr -d '\n')
+
 for u in "${USERS[@]}"; do
   s="${SECRETS[$u]}"
-  # ee prefix = fake-tls secret encoding
-  encoded_secret="ee${s}"
+  # fake-TLS secret format: ee + 32 hex secret + hex-encoded SNI domain
+  encoded_secret="ee${s}${domain_hex}"
 
   # Build tg:// proxy link
   tg_link="tg://proxy?server=${ANNOUNCE_IP}&port=${PORT}&secret=${encoded_secret}"

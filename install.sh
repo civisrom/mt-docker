@@ -87,7 +87,8 @@ install_packages() {
         lsb-release \
         apt-transport-https \
         jq \
-        sed
+        sed \
+        xxd
       ;;
     centos|rhel|rocky|almalinux|ol)
       info "Installing dependencies (yum) …"
@@ -99,7 +100,8 @@ install_packages() {
         gnupg2 \
         yum-utils \
         jq \
-        sed
+        sed \
+        vim-common
       ;;
     fedora)
       info "Installing dependencies (dnf) …"
@@ -111,13 +113,14 @@ install_packages() {
         gnupg2 \
         dnf-plugins-core \
         jq \
-        sed
+        sed \
+        vim-common
       ;;
     *)
       warn "Unknown distro '${DISTRO_ID}'. Trying apt-get …"
       apt-get update -qq && apt-get install -y -qq \
-        openssl curl wget ca-certificates gnupg lsb-release jq sed || {
-        err "Could not install packages. Install manually: openssl curl wget ca-certificates jq sed"
+        openssl curl wget ca-certificates gnupg lsb-release jq sed xxd || {
+        err "Could not install packages. Install manually: openssl curl wget ca-certificates jq sed xxd"
         exit 1
       }
       ;;
