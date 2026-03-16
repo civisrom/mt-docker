@@ -36,11 +36,11 @@ StandardError=journal
 SyslogIdentifier=telemt-compose
 
 # Security hardening
-PrivateTmp=yes
 NoNewPrivileges=yes
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=512
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target

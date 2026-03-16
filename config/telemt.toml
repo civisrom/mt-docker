@@ -11,7 +11,10 @@ secure = false
 tls = true
 
 [server]
-port = 443
+# В host mode это реальный порт на хосте.
+# 443 занят nginx — используем 4443.
+# Клиенты (relay-серверы) должны подключаться на этот порт.
+port = 4443
 listen_addr_ipv4 = "0.0.0.0"
 #listen_addr_ipv6 = "::"
 # metrics_port = 9090
@@ -19,6 +22,8 @@ listen_addr_ipv4 = "0.0.0.0"
 
 [[server.listeners]]
 ip = "0.0.0.0"
+# announce_ip — IP который telemt объявляет клиентам в proxy-ссылках.
+# Укажите ваш публичный IP (или IP relay-сервера, если клиенты идут через relay).
 announce_ip = "0.0.0.0"
 
 [censorship]

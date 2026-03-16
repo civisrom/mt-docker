@@ -50,6 +50,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 
   MAIN_SCRIPT_URL="${REPO_RAW}/install-mtproto.sh"
   TMP_SCRIPT=$(mktemp /tmp/install-mtproto.XXXXXX.sh)
+  trap 'rm -f "${TMP_SCRIPT}"' EXIT
 
   if command -v wget &>/dev/null; then
     wget -qO "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
@@ -57,19 +58,16 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     curl -fsSL -o "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
   else
     err "Neither wget nor curl found — cannot download uninstall script."
-    rm -f "${TMP_SCRIPT}"
     exit 1
   fi
 
   if [[ ! -s "${TMP_SCRIPT}" ]]; then
     err "Failed to download install-mtproto.sh"
-    rm -f "${TMP_SCRIPT}"
     exit 1
   fi
 
   chmod +x "${TMP_SCRIPT}"
   bash "${TMP_SCRIPT}" --uninstall
-  rm -f "${TMP_SCRIPT}"
   exit 0
 fi
 
@@ -240,6 +238,7 @@ install_docker_menu
 # ── download & run main script ─────────────────────────────────────────
 MAIN_SCRIPT_URL="${REPO_RAW}/install-mtproto.sh"
 TMP_SCRIPT=$(mktemp /tmp/install-mtproto.XXXXXX.sh)
+trap 'rm -f "${TMP_SCRIPT}"' EXIT
 
 info "Downloading install-mtproto.sh …"
 if command -v wget &>/dev/null; then
@@ -250,7 +249,6 @@ fi
 
 if [[ ! -s "${TMP_SCRIPT}" ]]; then
   err "Failed to download install-mtproto.sh"
-  rm -f "${TMP_SCRIPT}"
   exit 1
 fi
 
@@ -259,5 +257,3 @@ chmod +x "${TMP_SCRIPT}"
 info "Launching MTProto configuration …"
 echo ""
 bash "${TMP_SCRIPT}" "$@"
-
-rm -f "${TMP_SCRIPT}"

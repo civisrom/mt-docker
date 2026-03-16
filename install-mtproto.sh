@@ -28,6 +28,7 @@ info()  { printf "${GREEN}[INFO]${NC}  %s\n" "$*"; }
 warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
 err()   { printf "${RED}[ERR]${NC}   %s\n" "$*" >&2; }
 ask()   { printf "${CYAN}[?]${NC}    %s " "$*"; }
+header(){ printf "\n${BOLD}── %s ──${NC}\n\n" "$*"; }
 
 need_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -66,6 +67,65 @@ check_deps() {
     err "Run install.sh first, or install them manually."
     exit 1
   fi
+}
+
+# ── input validation helpers ──────────────────────────────────────────
+is_valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+is_valid_ipv4() {
+  local ip="$1"
+  local IFS='.'
+  local -a octets
+  read -ra octets <<< "$ip"
+  (( ${#octets[@]} == 4 )) || return 1
+  local o
+  for o in "${octets[@]}"; do
+    [[ "$o" =~ ^[0-9]+$ ]] || return 1
+    (( o >= 0 && o <= 255 )) || return 1
+  done
+  return 0
+}
+
+is_valid_domain() {
+  local d="$1"
+  # Basic domain validation: alphanumeric, hyphens, dots, 2+ parts
+  [[ "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && [[ "$d" == *.* ]]
+}
+
+# Sanitize input: strip dangerous characters for sed usage
+sanitize_input() {
+  local val="$1"
+  # Reject if contains shell metacharacters
+  if [[ "$val" == *"|"* || "$val" == *"&"* || "$val" == *";"* || \
+        "$val" == *"\`"* || "$val" == *"\$"* || "$val" == *">"* || \
+        "$val" == *"<"* || "$val" == *"'"* || "$val" == *"\\"* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Auto-detect public IP via external services
+detect_public_ip() {
+  local ip=""
+  local services=(
+    "https://ifconfig.me"
+    "https://api.ipify.org"
+    "https://ipecho.net/plain"
+    "https://icanhazip.com"
+  )
+  local svc
+  for svc in "${services[@]}"; do
+    ip=$(curl -fsSL --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null || true)
+    ip="${ip%%[[:space:]]*}"  # trim whitespace/newlines
+    if is_valid_ipv4 "$ip"; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # ── detect existing installation ──────────────────────────────────────
@@ -192,17 +252,19 @@ do_uninstall() {
 
 if [[ "${1:-}" == "--uninstall" ]]; then do_uninstall; fi
 
-# ── interactive config ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# ██  INTERACTIVE CONFIGURATION                                          ██
+# ══════════════════════════════════════════════════════════════════════════
 need_root
 check_deps
 
-info "=== MTProto Proxy (telemt) installer ==="
+echo ""
+info "=== MTProto Proxy (telemt) — Host Mode Installer ==="
 echo ""
 
 # ── detect & offer to remove previous installation ───────────────────
 if detect_existing_install; then
-  echo ""
-  printf "${BOLD}── Existing telemt installation detected ──${NC}\n"
+  header "Existing telemt installation detected"
 
   # show what was found
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
@@ -246,7 +308,11 @@ if detect_existing_install; then
   esac
 fi
 
-# --- users ---
+# ─────────────────────────────────────────────────────────────────────────
+# §1  USERS
+# ─────────────────────────────────────────────────────────────────────────
+header "User configuration"
+
 declare -a USERS=()
 declare -A SECRETS=()
 
@@ -271,55 +337,125 @@ if (( ${#USERS[@]} == 0 )); then
   exit 1
 fi
 
-# --- server ---
-ask "Server port [443]:"
-read -r PORT
-PORT=${PORT:-443}
-if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-  err "Invalid port number: ${PORT} (must be 1–65535)."
-  exit 1
+# ─────────────────────────────────────────────────────────────────────────
+# §2  NETWORK CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────
+header "Network configuration (host mode)"
+
+info "Container runs in host network mode — the port you set here"
+info "is the actual port on the host. Make sure it's not in use."
+echo ""
+
+# --- server port ---
+while true; do
+  ask "Telemt listen port [443]:"
+  read -r PORT
+  PORT=${PORT:-443}
+  if ! is_valid_port "$PORT"; then
+    warn "Invalid port: ${PORT} (must be 1–65535). Try again."
+    continue
+  fi
+  # Check if port is already in use (best-effort)
+  if command -v ss &>/dev/null; then
+    if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+      warn "Port ${PORT} appears to be already in use on this host."
+      ask "Use it anyway? [y/N]:"
+      read -r confirm_busy
+      if [[ ! "${confirm_busy,,}" =~ ^y ]]; then
+        continue
+      fi
+    fi
+  fi
+  break
+done
+
+# --- announce IP ---
+echo ""
+info "announce_ip — the public IP that telemt advertises in proxy links."
+info "Clients (Telegram relay servers) connect to this IP."
+echo ""
+
+DETECTED_IP=""
+info "Detecting public IP …"
+if DETECTED_IP=$(detect_public_ip); then
+  info "Detected: ${DETECTED_IP}"
+else
+  warn "Could not auto-detect public IP."
 fi
 
-ask "Announce IP (external IP of this server):"
-read -r ANNOUNCE_IP
-if [[ -z "$ANNOUNCE_IP" ]]; then
-  err "announce_ip is required."
-  exit 1
-fi
-if [[ "$ANNOUNCE_IP" == *"|"* || "$ANNOUNCE_IP" == *"&"* ]]; then
-  err "Invalid characters in announce_ip."
-  exit 1
-fi
+while true; do
+  if [[ -n "$DETECTED_IP" ]]; then
+    ask "Announce IP [${DETECTED_IP}]:"
+    read -r ANNOUNCE_IP
+    ANNOUNCE_IP=${ANNOUNCE_IP:-$DETECTED_IP}
+  else
+    ask "Announce IP (external IP of this server):"
+    read -r ANNOUNCE_IP
+  fi
 
-ask "TLS domain (e.g. example.com):"
-read -r TLS_DOMAIN
-if [[ -z "$TLS_DOMAIN" ]]; then
-  err "tls_domain is required."
-  exit 1
-fi
-if [[ "$TLS_DOMAIN" == *"|"* || "$TLS_DOMAIN" == *"&"* ]]; then
-  err "Invalid characters in tls_domain."
-  exit 1
-fi
+  if [[ -z "$ANNOUNCE_IP" ]]; then
+    warn "announce_ip is required."
+    continue
+  fi
+  if ! sanitize_input "$ANNOUNCE_IP"; then
+    warn "Invalid characters in IP address."
+    continue
+  fi
+  if ! is_valid_ipv4 "$ANNOUNCE_IP"; then
+    warn "Invalid IPv4 address: ${ANNOUNCE_IP}. Try again."
+    continue
+  fi
+  break
+done
 
-# --- docker port mapping ---
-ask "Host port to expose [${PORT}]:"
-read -r HOST_PORT
-HOST_PORT=${HOST_PORT:-$PORT}
-if ! [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || (( HOST_PORT < 1 || HOST_PORT > 65535 )); then
-  err "Invalid host port: ${HOST_PORT} (must be 1–65535)."
-  exit 1
-fi
+# ─────────────────────────────────────────────────────────────────────────
+# §3  TLS MASKING (CENSORSHIP BYPASS)
+# ─────────────────────────────────────────────────────────────────────────
+header "TLS masking (censorship bypass)"
 
-# --- systemd service ---
+info "Telemt disguises MTProto traffic as TLS to a legitimate website."
+info "Choose a popular HTTPS site that is NOT blocked in your region."
+info "Examples: www.google.com, www.microsoft.com, cloudflare.com"
+echo ""
+
+# --- TLS domain ---
+while true; do
+  ask "TLS domain [www.google.com]:"
+  read -r TLS_DOMAIN
+  TLS_DOMAIN=${TLS_DOMAIN:-www.google.com}
+
+  if ! sanitize_input "$TLS_DOMAIN"; then
+    warn "Invalid characters in domain."
+    continue
+  fi
+  if ! is_valid_domain "$TLS_DOMAIN"; then
+    warn "Invalid domain format: ${TLS_DOMAIN}. Try again."
+    continue
+  fi
+  break
+done
+
+# mask_port — HTTPS port on the masking domain, always 443
+MASK_PORT=443
+
+# ─────────────────────────────────────────────────────────────────────────
+# §4  SYSTEMD & AUTO-UPDATE
+# ─────────────────────────────────────────────────────────────────────────
+header "Systemd & auto-update"
+
 ask "Create systemd service for auto-start? [Y/n]:"
 read -r CREATE_SERVICE
 CREATE_SERVICE=${CREATE_SERVICE:-Y}
 
-# --- auto-update ---
 ask "Enable automatic daily image update? [Y/n]:"
 read -r AUTO_UPDATE
 AUTO_UPDATE=${AUTO_UPDATE:-Y}
+
+# ══════════════════════════════════════════════════════════════════════════
+# ██  DEPLOYMENT                                                          ██
+# ══════════════════════════════════════════════════════════════════════════
+
+header "Deploying"
 
 # ── prepare install directory ───────────────────────────────────────────
 info "Creating ${INSTALL_DIR} …"
@@ -344,25 +480,26 @@ show_link_val="[${show_link_val%, }]"
 
 # build [access.users] block into a temp file (avoids sed quoting issues)
 users_tmp=$(mktemp)
+trap 'rm -f "$users_tmp"' EXIT
 for u in "${USERS[@]}"; do
   echo "${u} = \"${SECRETS[$u]}\"" >> "$users_tmp"
 done
 
 # apply values with sed
-sed -i "s|^show_link = .*|show_link = ${show_link_val}|" "${INSTALL_DIR}/${CONFIG_FILE}"
-sed -i "s|^port = .*|port = ${PORT}|"                    "${INSTALL_DIR}/${CONFIG_FILE}"
-sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|" "${INSTALL_DIR}/${CONFIG_FILE}"
-sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"   "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^show_link = .*|show_link = ${show_link_val}|"              "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^port = .*|port = ${PORT}|"                                 "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|"         "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"           "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^mask_port = .*|mask_port = ${MASK_PORT}|"                   "${INSTALL_DIR}/${CONFIG_FILE}"
 
 # insert user lines after [access.users] using 'r' (read file) command
 sed -i "/^\[access\.users\]$/r ${users_tmp}" "${INSTALL_DIR}/${CONFIG_FILE}"
 rm -f "$users_tmp"
+trap - EXIT
 
-# ── patch docker-compose.yml ──────────────────────────────────────────
-info "Configuring ${COMPOSE_FILE} …"
-
-# replace port mapping line: "443:443/tcp" → "<HOST_PORT>:<PORT>/tcp"
-sed -i "s|\"443:443/tcp\"|\"${HOST_PORT}:${PORT}/tcp\"|" "${INSTALL_DIR}/${COMPOSE_FILE}"
+# ── Note: docker-compose.yml uses network_mode: host ─────────────────
+# Port exposure is controlled by telemt.toml [server] port setting,
+# not by Docker port mapping. No compose patching needed.
 
 # ── systemd service ────────────────────────────────────────────────────
 if [[ "${CREATE_SERVICE,,}" =~ ^y ]]; then
@@ -385,15 +522,22 @@ if [[ "${AUTO_UPDATE,,}" =~ ^y ]]; then
 [Unit]
 Description=Update Telemt MTProto Docker image
 Requires=docker.service
-After=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 WorkingDirectory=${INSTALL_DIR}
+# Pull with timeout, recreate only if image changed, prune old images
 ExecStart=/bin/sh -c '\
   docker compose pull -q && \
   docker compose up -d --remove-orphans && \
   docker image prune -f'
+# Retry on transient network failures
+Restart=on-failure
+RestartSec=60
+# Timeout for pull (large images, slow connections)
+TimeoutStartSec=300
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=${UPDATER_TIMER}
@@ -433,26 +577,78 @@ if ! docker compose up -d; then
   exit 1
 fi
 
-# ── summary ─────────────────────────────────────────────────────────────
+# ── wait for container to be healthy ──────────────────────────────────
+info "Waiting for telemt to start …"
+sleep 2
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'telemt'; then
+  info "Container 'telemt' is running."
+else
+  warn "Container may not have started properly. Check: docker logs telemt"
+fi
+
+# ── verify port is listening ──────────────────────────────────────────
+if command -v ss &>/dev/null; then
+  if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+    info "Port ${PORT} is listening — OK"
+  else
+    warn "Port ${PORT} does not appear to be listening yet."
+    warn "Check container logs: docker logs telemt"
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# ██  SUMMARY                                                             ██
+# ══════════════════════════════════════════════════════════════════════════
 echo ""
-info "========================================"
-info " Installation complete!"
-info "========================================"
-info "Install dir : ${INSTALL_DIR}"
-info "Config      : ${INSTALL_DIR}/${CONFIG_FILE}"
-info "Compose     : ${INSTALL_DIR}/${COMPOSE_FILE}"
-info "Port        : ${HOST_PORT} -> ${PORT}"
+printf "${BOLD}════════════════════════════════════════════${NC}\n"
+printf "${GREEN}${BOLD}  Installation complete!${NC}\n"
+printf "${BOLD}════════════════════════════════════════════${NC}\n"
 echo ""
-info "Users & secrets:"
+info "Install dir  : ${INSTALL_DIR}"
+info "Config       : ${INSTALL_DIR}/${CONFIG_FILE}"
+info "Compose      : ${INSTALL_DIR}/${COMPOSE_FILE}"
+info "Network      : host mode (no Docker port mapping)"
+info "Listen port  : ${PORT}"
+info "Announce IP  : ${ANNOUNCE_IP}"
+info "TLS domain   : ${TLS_DOMAIN}:${MASK_PORT}"
+echo ""
+
+# ── proxy links ────────────────────────────────────────────────────────
+info "Users & proxy links:"
+echo ""
 for u in "${USERS[@]}"; do
-  info "  ${u} = ${SECRETS[$u]}"
+  s="${SECRETS[$u]}"
+  # ee prefix = fake-tls secret encoding
+  encoded_secret="ee${s}"
+
+  # Build tg:// proxy link
+  tg_link="tg://proxy?server=${ANNOUNCE_IP}&port=${PORT}&secret=${encoded_secret}"
+
+  printf "  ${BOLD}%s${NC}\n" "$u"
+  printf "    Secret : %s\n" "$s"
+  printf "    Link   : ${CYAN}%s${NC}\n" "$tg_link"
+  echo ""
 done
-echo ""
+
+# ── management commands ────────────────────────────────────────────────
+header "Management commands"
+
 if [[ "${CREATE_SERVICE,,}" =~ ^y ]]; then
-  info "Service     : systemctl {start|stop|status} ${SERVICE_NAME}"
+  info "Service     : systemctl {start|stop|restart|status} ${SERVICE_NAME}"
+  info "Reload      : systemctl reload ${SERVICE_NAME}"
 fi
 if [[ "${AUTO_UPDATE,,}" =~ ^y ]]; then
   info "Auto-update : systemctl list-timers ${UPDATER_TIMER}.timer"
 fi
+info "Logs        : docker logs telemt --tail=50 -f"
+info "Config      : nano ${INSTALL_DIR}/${CONFIG_FILE}"
+info "Restart     : docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} up -d --force-recreate"
+info "Uninstall   : bash install-mtproto.sh --uninstall"
+
+# ── nftables reminder ──────────────────────────────────────────────────
 echo ""
-info "To view logs: docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} logs -f"
+printf "${YELLOW}${BOLD}⚠  FIREWALL REMINDER:${NC}\n"
+printf "${YELLOW}   Make sure your nftables config allows traffic on port ${PORT}.${NC}\n"
+printf "${YELLOW}   Check: define TELEMT_PORT = ${PORT}${NC}\n"
+printf "${YELLOW}   Apply: nft -f /etc/nftables.conf${NC}\n"
+echo ""
