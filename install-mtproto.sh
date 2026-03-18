@@ -348,7 +348,6 @@ if detect_existing_install; then
   done
 
   if (( ${#FOUND_CONTAINERS[@]} > 0 )); then
-    local cid cname cstate
     for cid in "${FOUND_CONTAINERS[@]}"; do
       cname=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||' || echo "$cid")
       cstate=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo "unknown")
@@ -357,16 +356,13 @@ if detect_existing_install; then
   fi
 
   if $FOUND_IMAGE; then
-    local itag
     itag=$(docker images --format '{{.Repository}}:{{.Tag}}  ({{.Size}})' \
       --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null | head -1 || echo "present")
     info "  Image             : ${itag}"
   fi
 
   if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
-    local su
     for su in "${FOUND_SYSTEMD[@]}"; do
-      local sstate
       sstate=$(systemctl is-active "$su" 2>/dev/null || echo "inactive")
       info "  Systemd unit      : ${su} (${sstate})"
     done
