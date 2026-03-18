@@ -130,29 +130,42 @@ detect_public_ip() {
 }
 
 # ── detect existing installation ──────────────────────────────────────
-# Searches for install dirs in: default path, systemd service files,
-# running/stopped containers, and docker images.
-# Sets: FOUND_DIRS (array), FOUND_CONTAINER (bool), FOUND_IMAGE (bool)
+# Searches for install dirs, systemd units, containers (by name AND by
+# image), and docker images.  Sets:
+#   FOUND_DIRS        — array of install directories
+#   FOUND_CONTAINERS  — array of container IDs (by name + by image)
+#   FOUND_SYSTEMD     — array of systemd unit file paths
+#   FOUND_IMAGE       — bool (telemt image present)
 detect_existing_install() {
   FOUND_DIRS=()
-  FOUND_CONTAINER=false
+  FOUND_CONTAINERS=()
+  FOUND_SYSTEMD=()
   FOUND_IMAGE=false
 
-  # helper: add dir to FOUND_DIRS if not already present
+  # helper: deduplicate values in an array variable
   _add_dir() {
     local d="$1"
-    if [[ -z "$d" || ! -d "$d" ]]; then return; fi
-    local existing
-    for existing in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
-      if [[ "$existing" == "$d" ]]; then return; fi
+    [[ -z "$d" || ! -d "$d" ]] && return
+    local e; for e in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
+      [[ "$e" == "$d" ]] && return
     done
     FOUND_DIRS+=("$d")
   }
 
-  # 1. Default install directory
+  _add_container() {
+    local c="$1"
+    [[ -z "$c" ]] && return
+    local e; for e in "${FOUND_CONTAINERS[@]+"${FOUND_CONTAINERS[@]}"}"; do
+      [[ "$e" == "$c" ]] && return
+    done
+    FOUND_CONTAINERS+=("$c")
+  }
+
+  # ── 1. Install directories ───────────────────────────────────────────
+  # 1a. Default path
   _add_dir "${INSTALL_DIR}"
 
-  # 2. WorkingDirectory from systemd service files
+  # 1b. WorkingDirectory from systemd service files
   local svc_path
   for svc_path in \
     "/etc/systemd/system/${SERVICE_FILE}" \
@@ -165,67 +178,121 @@ detect_existing_install() {
     fi
   done
 
-  # 3. Check for telemt container (running or stopped)
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'telemt'; then
-    FOUND_CONTAINER=true
+  # ── 2. Systemd units (service + timer + updater) ─────────────────────
+  local u
+  for u in "${SERVICE_FILE}" "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service"; do
+    [[ -f "/etc/systemd/system/$u" ]] && FOUND_SYSTEMD+=("$u")
+  done
+
+  # ── 3. Containers — by name 'telemt' ─────────────────────────────────
+  local cid
+  cid=$(docker ps -a --filter 'name=^telemt$' --format '{{.ID}}' 2>/dev/null || true)
+  [[ -n "$cid" ]] && _add_container "$cid"
+
+  # ── 4. Containers — by image 'whn0thacked/telemt-docker' ─────────────
+  #       Catches containers even if container_name was changed.
+  local img_cids
+  img_cids=$(docker ps -a --filter 'ancestor=whn0thacked/telemt-docker' --format '{{.ID}}' 2>/dev/null || true)
+  if [[ -n "$img_cids" ]]; then
+    while IFS= read -r cid; do
+      _add_container "$cid"
+    done <<< "$img_cids"
   fi
 
-  # 4. Check for telemt docker image
+  # ── 5. Docker image ──────────────────────────────────────────────────
   if docker images --format '{{.Repository}}' 2>/dev/null | grep -qx 'whn0thacked/telemt-docker'; then
     FOUND_IMAGE=true
   fi
 
   # Return 0 if anything was found
-  if (( ${#FOUND_DIRS[@]} > 0 )) || $FOUND_CONTAINER || $FOUND_IMAGE; then
+  if (( ${#FOUND_DIRS[@]} > 0 )) || \
+     (( ${#FOUND_CONTAINERS[@]} > 0 )) || \
+     (( ${#FOUND_SYSTEMD[@]} > 0 )) || \
+     $FOUND_IMAGE; then
     return 0
   fi
   return 1
 }
 
 # ── cleanup existing installation (targeted — telemt only) ────────────
+# Order of operations is critical:
+#   1. Stop systemd units FIRST  (prevents them from restarting containers)
+#   2. docker compose down        (graceful container + network + volume stop)
+#   3. Force-remove leftover containers (by ID — catches renamed ones too)
+#   4. Remove telemt docker images (only whn0thacked/telemt-docker)
+#   5. Prune dangling image layers
+#   6. Remove systemd unit files
+#   7. Remove install directories
 cleanup_existing_install() {
   echo ""
   info "── Removing existing telemt MTProto installation ──"
 
-  # 1. Stop containers via compose (for each found install dir)
+  # ── 1. Stop systemd units first (prevents restart races) ─────────────
+  if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
+    info "Stopping systemd units …"
+    local u
+    for u in "${FOUND_SYSTEMD[@]}"; do
+      info "  stopping: $u"
+      systemctl stop "$u" 2>/dev/null || true
+      systemctl disable "$u" 2>/dev/null || true
+    done
+  fi
+
+  # ── 2. docker compose down (graceful: stops containers, removes ──────
+  #        project networks and anonymous volumes)
   local dir
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
     if [[ -f "${dir}/${COMPOSE_FILE}" ]]; then
-      info "Stopping containers (${dir}/${COMPOSE_FILE}) …"
-      docker compose -f "${dir}/${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
+      info "Running compose down (${dir}/${COMPOSE_FILE}) …"
+      docker compose -f "${dir}/${COMPOSE_FILE}" down \
+        --remove-orphans --volumes 2>/dev/null || true
     fi
   done
 
-  # 2. Force-remove container 'telemt' if still present
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'telemt'; then
-    info "Force-removing container 'telemt' …"
-    docker rm -f telemt 2>/dev/null || true
+  # ── 3. Force-remove any leftover containers (by ID) ─────────────────
+  #        Uses container IDs collected in detect_existing_install —
+  #        includes containers found by name AND by image.
+  if (( ${#FOUND_CONTAINERS[@]} > 0 )); then
+    info "Force-removing telemt containers …"
+    local cid cname
+    for cid in "${FOUND_CONTAINERS[@]}"; do
+      cname=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||' || echo "$cid")
+      info "  removing container: ${cname} (${cid:0:12})"
+      docker rm -f "$cid" 2>/dev/null || true
+    done
   fi
 
-  # 3. Remove only telemt docker images (all tags)
-  local telemt_image_ids
-  telemt_image_ids=$(docker images --format '{{.ID}}' --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null || true)
-  if [[ -n "$telemt_image_ids" ]]; then
-    info "Removing telemt Docker images …"
-    local img_id
-    while IFS= read -r img_id; do
-      docker rmi -f "$img_id" 2>/dev/null || true
-    done <<< "$telemt_image_ids"
+  # ── 4. Remove telemt docker images (all tags) ───────────────────────
+  if $FOUND_IMAGE; then
+    local telemt_image_ids
+    telemt_image_ids=$(docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' \
+      --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null || true)
+    if [[ -n "$telemt_image_ids" ]]; then
+      info "Removing telemt Docker images …"
+      local img_line img_id img_tag
+      while IFS= read -r img_line; do
+        img_id="${img_line%% *}"
+        img_tag="${img_line#* }"
+        info "  removing image: ${img_tag} (${img_id:0:12})"
+        docker rmi -f "$img_id" 2>/dev/null || true
+      done <<< "$telemt_image_ids"
+    fi
   fi
 
-  # 4. Disable and remove systemd units
-  info "Removing systemd units …"
-  local u
-  for u in "${SERVICE_FILE}" "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service"; do
-    if [[ -f "/etc/systemd/system/$u" ]]; then
-      systemctl disable --now "$u" 2>/dev/null || true
+  # ── 5. Prune dangling layers left after image removal ───────────────
+  docker image prune -f 2>/dev/null || true
+
+  # ── 6. Remove systemd unit files from disk ──────────────────────────
+  if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
+    info "Removing systemd unit files …"
+    for u in "${FOUND_SYSTEMD[@]}"; do
       rm -f "/etc/systemd/system/$u"
-      info "  removed: $u"
-    fi
-  done
-  systemctl daemon-reload 2>/dev/null || true
+      info "  deleted: /etc/systemd/system/$u"
+    done
+    systemctl daemon-reload 2>/dev/null || true
+  fi
 
-  # 5. Remove install directories and their config files
+  # ── 7. Remove install directories ───────────────────────────────────
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
     if [[ -d "$dir" ]]; then
       info "Removing directory: ${dir} …"
@@ -279,13 +346,30 @@ if detect_existing_install; then
       info "    compose         : ${dir}/${COMPOSE_FILE}"
     fi
   done
-  if $FOUND_CONTAINER; then
-    cstate=$(docker inspect -f '{{.State.Status}}' telemt 2>/dev/null || echo "unknown")
-    info "  Container 'telemt': ${cstate}"
+
+  if (( ${#FOUND_CONTAINERS[@]} > 0 )); then
+    local cid cname cstate
+    for cid in "${FOUND_CONTAINERS[@]}"; do
+      cname=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||' || echo "$cid")
+      cstate=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo "unknown")
+      info "  Container         : ${cname} (${cstate})"
+    done
   fi
+
   if $FOUND_IMAGE; then
-    itag=$(docker images --format '{{.Repository}}:{{.Tag}}  ({{.Size}})' --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null | head -1 || echo "present")
+    local itag
+    itag=$(docker images --format '{{.Repository}}:{{.Tag}}  ({{.Size}})' \
+      --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null | head -1 || echo "present")
     info "  Image             : ${itag}"
+  fi
+
+  if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
+    local su
+    for su in "${FOUND_SYSTEMD[@]}"; do
+      local sstate
+      sstate=$(systemctl is-active "$su" 2>/dev/null || echo "inactive")
+      info "  Systemd unit      : ${su} (${sstate})"
+    done
   fi
 
   echo ""
