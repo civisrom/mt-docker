@@ -3,12 +3,30 @@ services:
     image: whn0thacked/telemt-docker:latest
     container_name: telemt
     restart: unless-stopped
+
+    # ---------------------------------------------------------------
+    # Root user requirement for binding privileged ports (<1024)
+    # The default image runs as 'nonroot' to minimize attack vectors.
+    # Uncomment the line below to run as root ONLY if you need to bind
+    # to port 443 and encounter 'os error 13'.
+    # ---------------------------------------------------------------
+    # user: "root"
+
     # Telemt uses RUST_LOG for verbosity (optional)
     environment:
       RUST_LOG: "info"
-    # Telemt reads config from CMD (default: /etc/telemt.toml)
+
+    # ---------------------------------------------------------------
+    # API Configuration writes (Atomic Config Save)
+    # The API performs atomic writes (creates a .tmp file and renames it).
+    # To allow the API to save changes to the config, we MUST mount the
+    # ENTIRE directory (not just the file) and ensure it is writable.
+    # We override the default command to point to the mounted file.
+    # ---------------------------------------------------------------
+    command: ["/etc/telemt/telemt.toml"]
     volumes:
-      - ./telemt.toml:/etc/telemt.toml:ro
+      - ./telemt-config:/etc/telemt
+
     # ---------------------------------------------------------------
     # Host network mode: the container uses the host's network stack
     # directly. The "ports" section is IGNORED in this mode — Telemt
@@ -18,11 +36,18 @@ services:
     # "network_mode: host" and uncomment the "ports" section below.
     # ---------------------------------------------------------------
     network_mode: host
+
     # ports:
     #   - "443:443/tcp"
     #   # If you enable metrics_port=9090 in config:
     #   # - "127.0.0.1:9090:9090/tcp"
+
     # Hardening
+    # ---------------------------------------------------------------
+    # If you uncommented `user: "root"` above to bind to port 443,
+    # you MUST comment out the two lines below, as they prevent
+    # gaining the necessary privileges for binding restricted ports.
+    # ---------------------------------------------------------------
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -32,11 +57,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=16m
-    # File descriptor limits (critical for high-connection proxy)
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
+
     # Resource limits
     deploy:
       resources:
@@ -46,6 +67,13 @@ services:
         reservations:
           cpus: "0.25"
           memory: 128M
+
+    # File descriptor limits (critical for high-connection proxy)
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
     logging:
       driver: json-file
       options:

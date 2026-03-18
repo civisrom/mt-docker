@@ -1,6 +1,6 @@
 # mt-docker
 
-Интерактивный скрипт установки MTProto-прокси [telemt-docker](https://github.com/An0nX/telemt-docker).
+Интерактивный скрипт установки MTProto-прокси [telemt-docker](https://gitlab.com/An0nX/telemt-docker).
 
 ## Быстрый старт (одна команда)
 
@@ -45,13 +45,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/civisrom/mt-docker/main/inst
 Контейнер работает в **host network mode** — без Docker port mapping.
 Порт задаётся в `telemt.toml` секции `[server] port` и является реальным портом на хосте.
 
+### Привилегированные порты (<1024)
+
+Upstream-образ запускается от **non-root** пользователя по умолчанию. Если выбран порт ниже 1024 (например, 443), скрипт автоматически включает `user: "root"` в `docker-compose.yml` и отключает `no-new-privileges`, так как привязка к таким портам требует прав root.
+
+### Монтирование конфигурации
+
+Конфигурация монтируется как **директория** (`telemt-config/`), а не как отдельный файл. Это необходимо для поддержки атомарной записи конфигурации (API создаёт `.tmp` файл и переименовывает его).
+
 После установки скрипт генерирует `tg://proxy` ссылки для каждого пользователя с fake-TLS кодированием.
 
 ## Создаваемые файлы
 
 | Файл | Расположение |
 |------|--------------|
-| `telemt.toml` | `/opt/telemt/telemt.toml` |
+| `telemt.toml` | `/opt/telemt/telemt-config/telemt.toml` |
 | `docker-compose.yml` | `/opt/telemt/docker-compose.yml` |
 | Systemd-служба | `/etc/systemd/system/telemt-compose.service` |
 | Таймер обновления | `/etc/systemd/system/telemt-compose-update.timer` |
