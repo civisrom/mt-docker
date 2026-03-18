@@ -60,7 +60,8 @@ check_deps() {
   for cmd in docker openssl sed xxd; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
-  if ! docker compose version &>/dev/null; then
+  # Only check compose plugin if docker itself is present
+  if command -v docker &>/dev/null && ! docker compose version &>/dev/null; then
     missing+=("docker-compose-plugin")
   fi
   if (( ${#missing[@]} )); then
@@ -279,8 +280,9 @@ cleanup_existing_install() {
     fi
   fi
 
-  # ── 5. Prune dangling layers left after image removal ───────────────
-  docker image prune -f 2>/dev/null || true
+  # ── 5. Prune only dangling layers created in the last hour ──────────
+  #        Avoids accidentally removing dangling images from other projects.
+  docker image prune -f --filter "until=1h" 2>/dev/null || true
 
   # ── 6. Remove systemd unit files from disk ──────────────────────────
   if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
@@ -409,6 +411,11 @@ while true; do
     warn "Username may only contain letters, digits, '_' and '-'. Try again."
     continue
   fi
+  # reject duplicate usernames
+  if [[ -n "${SECRETS[$uname]+_}" ]]; then
+    warn "User '${uname}' already added. Try a different name."
+    continue
+  fi
   secret=$(openssl rand -hex 16)
   USERS+=("$uname")
   SECRETS["$uname"]="$secret"
@@ -440,7 +447,7 @@ while true; do
   fi
   # Check if port is already in use (best-effort)
   if command -v ss &>/dev/null; then
-    if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+    if ss -tlnp 2>/dev/null | grep -qE "[[:space:]][^[:space:]]*:${PORT}[[:space:]]"; then
       warn "Port ${PORT} appears to be already in use on this host."
       ask "Use it anyway? [y/N]:"
       read -r confirm_busy
@@ -695,7 +702,7 @@ fi
 
 # ── verify port is listening ──────────────────────────────────────────
 if command -v ss &>/dev/null; then
-  if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+  if ss -tlnp 2>/dev/null | grep -qE "[[:space:]][^[:space:]]*:${PORT}[[:space:]]"; then
     info "Port ${PORT} is listening — OK"
   else
     warn "Port ${PORT} does not appear to be listening yet."

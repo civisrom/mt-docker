@@ -1,6 +1,6 @@
 [Unit]
 Description=Telemt MTProto Proxy (Docker Compose)
-Documentation=https://github.com/An0nX/telemt-docker
+Documentation=https://gitlab.com/An0nX/telemt-docker
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
