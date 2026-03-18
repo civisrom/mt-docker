@@ -11,6 +11,7 @@ set -euo pipefail
 
 # ── defaults ────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/telemt"
+CONFIG_DIR="telemt-config"       # subdirectory for telemt.toml (mounted as volume)
 SERVICE_NAME="telemt-compose"
 COMPOSE_FILE="docker-compose.yml"
 CONFIG_FILE="telemt.toml"
@@ -269,8 +270,10 @@ if detect_existing_install; then
   # show what was found
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
     info "  Install directory : ${dir}"
-    if [[ -f "${dir}/${CONFIG_FILE}" ]]; then
-      info "    config          : ${dir}/${CONFIG_FILE}"
+    if [[ -f "${dir}/${CONFIG_DIR}/${CONFIG_FILE}" ]]; then
+      info "    config          : ${dir}/${CONFIG_DIR}/${CONFIG_FILE}"
+    elif [[ -f "${dir}/${CONFIG_FILE}" ]]; then
+      info "    config (legacy) : ${dir}/${CONFIG_FILE}"
     fi
     if [[ -f "${dir}/${COMPOSE_FILE}" ]]; then
       info "    compose         : ${dir}/${COMPOSE_FILE}"
@@ -461,12 +464,20 @@ header "Deploying"
 info "Creating ${INSTALL_DIR} …"
 mkdir -p "${INSTALL_DIR}"
 
+# Create config subdirectory (mounted as volume for atomic config writes)
+info "Creating ${INSTALL_DIR}/${CONFIG_DIR} …"
+mkdir -p "${INSTALL_DIR}/${CONFIG_DIR}"
+
 # ── download templates from repo config/ ───────────────────────────────
 info "Downloading template: ${CONFIG_FILE} …"
-download "${CONFIG_URL}/${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_FILE}"
+download "${CONFIG_URL}/${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 
 info "Downloading template: ${COMPOSE_FILE} …"
 download "${CONFIG_URL}/${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
+
+# Set permissions so the container's non-root user can modify the config
+chmod 777 "${INSTALL_DIR}/${CONFIG_DIR}"
+chmod 666 "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 
 # ── patch telemt.toml ──────────────────────────────────────────────────
 info "Configuring ${CONFIG_FILE} …"
@@ -485,17 +496,33 @@ for u in "${USERS[@]}"; do
   echo "${u} = \"${SECRETS[$u]}\"" >> "$users_tmp"
 done
 
+# full path to the config file inside the subdirectory
+CONFIG_PATH="${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
+
 # apply values with sed
-sed -i "s|^show_link = .*|show_link = ${show_link_val}|"              "${INSTALL_DIR}/${CONFIG_FILE}"
-sed -i "s|^port = .*|port = ${PORT}|"                                 "${INSTALL_DIR}/${CONFIG_FILE}"
-sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|"         "${INSTALL_DIR}/${CONFIG_FILE}"
-sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"           "${INSTALL_DIR}/${CONFIG_FILE}"
-sed -i "s|^mask_port = .*|mask_port = ${MASK_PORT}|"                   "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "s|^show_link = .*|show_link = ${show_link_val}|"              "${CONFIG_PATH}"
+sed -i "s|^port = .*|port = ${PORT}|"                                 "${CONFIG_PATH}"
+sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|"         "${CONFIG_PATH}"
+sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"           "${CONFIG_PATH}"
+sed -i "s|^mask_port = .*|mask_port = ${MASK_PORT}|"                   "${CONFIG_PATH}"
 
 # insert user lines after [access.users] using 'r' (read file) command
-sed -i "/^\[access\.users\]$/r ${users_tmp}" "${INSTALL_DIR}/${CONFIG_FILE}"
+sed -i "/^\[access\.users\]$/r ${users_tmp}" "${CONFIG_PATH}"
 rm -f "$users_tmp"
 trap - EXIT
+
+# ── privileged port handling ───────────────────────────────────────────
+# The upstream image runs as non-root by default. Ports below 1024
+# require root inside the container, so we must enable user: "root"
+# and disable no-new-privileges in docker-compose.yml.
+if (( PORT < 1024 )); then
+  info "Port ${PORT} is privileged (<1024) — enabling root user in compose."
+  # Uncomment user: "root"
+  sed -i 's|^    # user: "root"|    user: "root"|' "${INSTALL_DIR}/${COMPOSE_FILE}"
+  # Comment out security_opt and no-new-privileges
+  sed -i 's|^    security_opt:$|    # security_opt:|'                          "${INSTALL_DIR}/${COMPOSE_FILE}"
+  sed -i 's|^      - no-new-privileges:true$|    #   - no-new-privileges:true|' "${INSTALL_DIR}/${COMPOSE_FILE}"
+fi
 
 # ── Note: docker-compose.yml uses network_mode: host ─────────────────
 # Port exposure is controlled by telemt.toml [server] port setting,
@@ -605,7 +632,8 @@ printf "${GREEN}${BOLD}  Installation complete!${NC}\n"
 printf "${BOLD}════════════════════════════════════════════${NC}\n"
 echo ""
 info "Install dir  : ${INSTALL_DIR}"
-info "Config       : ${INSTALL_DIR}/${CONFIG_FILE}"
+info "Config dir   : ${INSTALL_DIR}/${CONFIG_DIR}"
+info "Config       : ${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 info "Compose      : ${INSTALL_DIR}/${COMPOSE_FILE}"
 info "Network      : host mode (no Docker port mapping)"
 info "Listen port  : ${PORT}"
@@ -645,7 +673,7 @@ if [[ "${AUTO_UPDATE,,}" =~ ^y ]]; then
   info "Auto-update : systemctl list-timers ${UPDATER_TIMER}.timer"
 fi
 info "Logs        : docker logs telemt --tail=50 -f"
-info "Config      : nano ${INSTALL_DIR}/${CONFIG_FILE}"
+info "Config      : nano ${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 info "Restart     : docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} up -d --force-recreate"
 info "Uninstall   : bash install-mtproto.sh --uninstall"
 
