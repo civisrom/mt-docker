@@ -675,22 +675,248 @@ if detect_existing_install; then
     done
   fi
 
+  # Show current version & auto-update status
+  echo ""
+  local cur_ver="unknown"
+  if [[ -f "${VERSION_FILE}" ]]; then
+    cur_ver=$(cat "${VERSION_FILE}" 2>/dev/null || echo "unknown")
+  elif [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
+    cur_ver=$(grep -oP "image:\s*${DOCKER_IMAGE}:\K.*" "${INSTALL_DIR}/${COMPOSE_FILE}" 2>/dev/null || echo "unknown")
+  fi
+  info "  Current version   : ${DOCKER_IMAGE}:${cur_ver}"
+
+  local update_state="not installed"
+  if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
+    update_state="${GREEN}ENABLED${NC}"
+  elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
+    update_state="${YELLOW}DISABLED${NC}"
+  fi
+  printf "  ${GREEN}[INFO]${NC}  Auto-update      : ${update_state}\n"
+
   echo ""
   printf "${BOLD}Choose an option:${NC}\n"
-  echo "  1) Remove existing installation completely and install fresh"
-  echo "  2) Cancel installation"
+  echo "  1) Change version (show available & switch)"
+  echo "  2) Toggle auto-update (enable / disable)"
+  echo "  3) Remove existing installation and install fresh"
+  echo "  4) Exit"
   echo ""
-  ask "Your choice [1/2]:"
-  read -r reinstall_choice
+  ask "Your choice [1-4]:"
+  read -r mgmt_choice
 
-  case "${reinstall_choice}" in
+  case "${mgmt_choice}" in
     1)
-      cleanup_existing_install
-      ;;
-    2)
-      info "Installation cancelled."
+      # ── Interactive version switch ──────────────────────────────
+      header "Change version"
+      info "Current version: ${cur_ver}"
+      echo ""
+
+      info "Fetching available versions from Docker Hub …"
+      local versions=""
+      versions=$(fetch_available_versions) || true
+
+      if [[ -z "$versions" ]]; then
+        err "Could not fetch version list."
+        exit 1
+      fi
+
+      local -a ver_array=()
+      while IFS= read -r v; do
+        ver_array+=("$v")
+      done <<< "$versions"
+
+      local total=${#ver_array[@]}
+      echo ""
+      printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
+      printf "  %-4s  %-14s\n" "---" "-----------"
+      printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (always newest)\n" "0" "latest"
+
+      local i
+      for (( i=0; i<total && i<15; i++ )); do
+        local marker=""
+        if [[ "${ver_array[$i]}" == "$cur_ver" ]]; then
+          marker="  <-- current"
+        fi
+        if (( i == 0 )); then
+          printf "  ${CYAN}%-4s  %-14s${NC}  (newest release)%s\n" "$((i+1))" "${ver_array[$i]}" "$marker"
+        else
+          printf "  %-4s  %-14s%s\n" "$((i+1))" "${ver_array[$i]}" "$marker"
+        fi
+      done
+
+      if (( total > 15 )); then
+        info "  … and $((total - 15)) more (showing top 15)"
+      fi
+
+      echo ""
+      ask "Select version [0=latest]:"
+      read -r ver_choice
+      ver_choice=${ver_choice:-0}
+
+      local target_ver=""
+      if [[ "$ver_choice" == "0" ]]; then
+        target_ver="latest"
+      elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= total && ver_choice <= 15 )); then
+        target_ver="${ver_array[$((ver_choice - 1))]}"
+      else
+        err "Invalid choice."
+        exit 1
+      fi
+
+      if [[ "$target_ver" == "$cur_ver" ]]; then
+        info "Already running version ${cur_ver}. No changes needed."
+        exit 0
+      fi
+
+      info "Switching: ${cur_ver} → ${target_ver}"
+
+      sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${target_ver}|" \
+        "${INSTALL_DIR}/${COMPOSE_FILE}"
+      echo "${target_ver}" > "${VERSION_FILE}"
+
+      cd "${INSTALL_DIR}" || exit 1
+      info "Pulling image …"
+      if ! docker compose pull; then
+        err "Failed to pull ${DOCKER_IMAGE}:${target_ver}"
+        exit 1
+      fi
+
+      info "Restarting container …"
+      docker compose up -d --force-recreate
+
+      # Smart auto-update handling
+      if [[ "$target_ver" != "latest" ]]; then
+        if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
+          echo ""
+          warn "Auto-update is ENABLED but version is now pinned to ${target_ver}."
+          warn "The timer will only re-pull this same tag (no-op)."
+          ask "Disable auto-update? [Y/n]:"
+          read -r disable_upd
+          disable_upd=${disable_upd:-Y}
+          if [[ "${disable_upd,,}" =~ ^y ]]; then
+            systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
+            systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+            info "Auto-update disabled."
+          fi
+        fi
+      fi
+
+      echo ""
+      info "Done. Running version: ${target_ver}"
       exit 0
       ;;
+
+    2)
+      # ── Toggle auto-update ──────────────────────────────────────
+      header "Auto-update management"
+
+      if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
+        printf "  Auto-update is currently: ${GREEN}${BOLD}ENABLED${NC}\n"
+        local next_run
+        next_run=$(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | grep "${UPDATER_TIMER}" || echo "")
+        if [[ -n "$next_run" ]]; then
+          info "  ${next_run}"
+        fi
+        echo ""
+        ask "Disable auto-update? [Y/n]:"
+        read -r toggle_choice
+        toggle_choice=${toggle_choice:-Y}
+        if [[ "${toggle_choice,,}" =~ ^y ]]; then
+          systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
+          systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+          info "Auto-update DISABLED."
+        else
+          info "No changes."
+        fi
+      elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
+        printf "  Auto-update is currently: ${YELLOW}${BOLD}DISABLED${NC}\n"
+        echo ""
+
+        # Warn if version is pinned
+        if [[ -f "${VERSION_FILE}" ]]; then
+          local pinned
+          pinned=$(cat "${VERSION_FILE}" 2>/dev/null || true)
+          if [[ -n "$pinned" && "$pinned" != "latest" ]]; then
+            warn "Version is pinned to '${pinned}'."
+            warn "Auto-update will only re-pull this same tag."
+            ask "Switch to 'latest' and enable auto-update? [Y/n]:"
+            read -r switch_and_enable
+            switch_and_enable=${switch_and_enable:-Y}
+            if [[ "${switch_and_enable,,}" =~ ^y ]]; then
+              sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:latest|" \
+                "${INSTALL_DIR}/${COMPOSE_FILE}"
+              echo "latest" > "${VERSION_FILE}"
+              info "Switched to 'latest'."
+            fi
+          fi
+        fi
+
+        ask "Enable auto-update? [Y/n]:"
+        read -r toggle_choice
+        toggle_choice=${toggle_choice:-Y}
+        if [[ "${toggle_choice,,}" =~ ^y ]]; then
+          systemctl enable --now "${UPDATER_TIMER}.timer" 2>/dev/null
+          info "Auto-update ENABLED."
+        else
+          info "No changes."
+        fi
+      else
+        warn "Auto-update timer is not installed."
+        ask "Create and enable auto-update timer? [Y/n]:"
+        read -r create_timer
+        create_timer=${create_timer:-Y}
+        if [[ "${create_timer,,}" =~ ^y ]]; then
+          cat > "/etc/systemd/system/${UPDATER_TIMER}.service" <<UPDEOF2
+[Unit]
+Description=Update Telemt MTProto Docker image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=/bin/sh -c '\
+  docker compose pull -q && \
+  docker compose up -d --remove-orphans && \
+  docker image prune -f'
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${UPDATER_TIMER}
+UPDEOF2
+
+          cat > "/etc/systemd/system/${UPDATER_TIMER}.timer" <<TMREOF2
+[Unit]
+Description=Daily update for Telemt MTProto Docker image
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TMREOF2
+
+          systemctl daemon-reload
+          systemctl enable --now "${UPDATER_TIMER}.timer"
+          info "Auto-update timer created and ENABLED (daily at ~04:00)."
+        fi
+      fi
+      exit 0
+      ;;
+
+    3)
+      cleanup_existing_install
+      ;;
+
+    4)
+      info "Exiting."
+      exit 0
+      ;;
+
     *)
       err "Invalid choice. Exiting."
       exit 1
