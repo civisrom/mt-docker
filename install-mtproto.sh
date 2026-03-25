@@ -686,7 +686,36 @@ while true; do
     warn "User '${uname}' already added. Try a different name."
     continue
   fi
-  secret=$(openssl rand -hex 16)
+
+  echo ""
+  printf "  ${BOLD}Secret for '${uname}':${NC}\n"
+  echo "  1) Generate automatically (random 32-hex)"
+  echo "  2) Enter custom secret (32 hex characters)"
+  echo ""
+  ask "Choice [1]:"
+  read -r secret_choice
+  secret_choice=${secret_choice:-1}
+
+  if [[ "$secret_choice" == "2" ]]; then
+    while true; do
+      ask "Enter 32-char hex secret:"
+      read -r secret
+      # trim whitespace
+      secret="${secret#"${secret%%[![:space:]]*}"}"
+      secret="${secret%"${secret##*[![:space:]]}"}"
+      # lowercase
+      secret="${secret,,}"
+      if [[ ! "$secret" =~ ^[0-9a-f]{32}$ ]]; then
+        warn "Invalid secret: must be exactly 32 hexadecimal characters (0-9, a-f)."
+        warn "Got ${#secret} chars: '${secret}'"
+        continue
+      fi
+      break
+    done
+  else
+    secret=$(openssl rand -hex 16)
+  fi
+
   USERS+=("$uname")
   SECRETS["$uname"]="$secret"
   info "Added user: ${uname}  secret: ${secret}"
