@@ -44,32 +44,44 @@ detect_distro() {
 detect_distro
 info "Detected distro: ${DISTRO_ID}"
 
-# ── fast path: --uninstall (skip package install & Docker menu) ───────
-if [[ "${1:-}" == "--uninstall" ]]; then
-  info "Uninstall mode — skipping dependency and Docker installation."
+# ── fast path: management subcommands (skip package install & Docker menu) ──
+# These don't need full bootstrap — just download and run install-mtproto.sh
+_fast_path_commands=(
+  "--uninstall"
+  "--list-versions"
+  "--set-version"
+  "--update-enable"
+  "--update-disable"
+  "--update-status"
+)
 
-  MAIN_SCRIPT_URL="${REPO_RAW}/install-mtproto.sh"
-  TMP_SCRIPT=$(mktemp /tmp/install-mtproto.XXXXXX.sh)
-  trap 'rm -f "${TMP_SCRIPT}"' EXIT
+for _fpc in "${_fast_path_commands[@]}"; do
+  if [[ "${1:-}" == "$_fpc" ]]; then
+    info "Running '${1}' — skipping dependency and Docker installation."
 
-  if command -v wget &>/dev/null; then
-    wget -qO "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
-  elif command -v curl &>/dev/null; then
-    curl -fsSL -o "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
-  else
-    err "Neither wget nor curl found — cannot download uninstall script."
-    exit 1
+    MAIN_SCRIPT_URL="${REPO_RAW}/install-mtproto.sh"
+    TMP_SCRIPT=$(mktemp /tmp/install-mtproto.XXXXXX.sh)
+    trap 'rm -f "${TMP_SCRIPT}"' EXIT
+
+    if command -v wget &>/dev/null; then
+      wget -qO "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
+    elif command -v curl &>/dev/null; then
+      curl -fsSL -o "${TMP_SCRIPT}" "${MAIN_SCRIPT_URL}"
+    else
+      err "Neither wget nor curl found — cannot download script."
+      exit 1
+    fi
+
+    if [[ ! -s "${TMP_SCRIPT}" ]]; then
+      err "Failed to download install-mtproto.sh"
+      exit 1
+    fi
+
+    chmod +x "${TMP_SCRIPT}"
+    bash "${TMP_SCRIPT}" "$@"
+    exit 0
   fi
-
-  if [[ ! -s "${TMP_SCRIPT}" ]]; then
-    err "Failed to download install-mtproto.sh"
-    exit 1
-  fi
-
-  chmod +x "${TMP_SCRIPT}"
-  bash "${TMP_SCRIPT}" --uninstall
-  exit 0
-fi
+done
 
 # ── install system packages ────────────────────────────────────────────
 install_packages() {

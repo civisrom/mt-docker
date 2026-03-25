@@ -66,7 +66,7 @@ download() {
 
 check_deps() {
   local missing=()
-  for cmd in docker openssl sed xxd; do
+  for cmd in docker openssl sed xxd curl; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   # Only check compose plugin if docker itself is present
@@ -129,7 +129,13 @@ detect_public_ip() {
   )
   local svc
   for svc in "${services[@]}"; do
-    ip=$(curl -fsSL --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null || true)
+    if command -v curl &>/dev/null; then
+      ip=$(curl -fsSL --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null || true)
+    elif command -v wget &>/dev/null; then
+      ip=$(wget -qO- --timeout=10 "$svc" 2>/dev/null || true)
+    else
+      return 1
+    fi
     ip="${ip%%[[:space:]]*}"  # trim whitespace/newlines
     if is_valid_ipv4 "$ip"; then
       echo "$ip"
@@ -346,17 +352,25 @@ fetch_available_versions() {
   fi
 
   # Extract semver tags (X.Y.Z), exclude pre-releases, cache, commit hashes
+  local tags=""
   if command -v jq &>/dev/null; then
-    echo "$raw_json" | jq -r '.results[].name' 2>/dev/null \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -t. -k1,1rn -k2,2rn -k3,3rn
+    tags=$(echo "$raw_json" | jq -r '.results[].name' 2>/dev/null || true)
   else
-    # Fallback: parse JSON without jq using grep/sed
-    echo "$raw_json" \
-      | grep -oP '"name"\s*:\s*"\K[^"]+' \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -t. -k1,1rn -k2,2rn -k3,3rn
+    # Fallback: parse JSON without jq using portable grep/sed (no -P flag)
+    tags=$(echo "$raw_json" \
+      | sed 's/,/\n/g' \
+      | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)
   fi
+
+  if [[ -z "$tags" ]]; then
+    return 1
+  fi
+
+  # Filter to semver-only and sort newest first
+  echo "$tags" \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sort -t. -k1,1rn -k2,2rn -k3,3rn \
+    || true
 }
 
 # Display version selection menu and set SELECTED_VERSION
@@ -364,8 +378,8 @@ select_version() {
   header "Version selection"
 
   info "Fetching available versions from Docker Hub …"
-  local versions
-  versions=$(fetch_available_versions)
+  local versions=""
+  versions=$(fetch_available_versions) || true
 
   if [[ -z "$versions" ]]; then
     warn "Could not fetch version list. Using 'latest'."
@@ -428,6 +442,26 @@ do_update_enable() {
     err "Auto-update timer not found. Run install first."
     exit 1
   fi
+
+  # Warn if version is pinned (auto-update would be a no-op)
+  if [[ -f "${VERSION_FILE}" ]]; then
+    local pinned
+    pinned=$(cat "${VERSION_FILE}" 2>/dev/null || true)
+    if [[ -n "$pinned" && "$pinned" != "latest" ]]; then
+      warn "Version is pinned to '${pinned}'."
+      warn "Auto-update will only re-pull this same version (no-op)."
+      ask "Switch to 'latest' to receive new versions? [Y/n]:"
+      read -r switch_latest
+      switch_latest=${switch_latest:-Y}
+      if [[ "${switch_latest,,}" =~ ^y ]]; then
+        sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:latest|" \
+          "${INSTALL_DIR}/${COMPOSE_FILE}"
+        echo "latest" > "${VERSION_FILE}"
+        info "Switched to 'latest'."
+      fi
+    fi
+  fi
+
   systemctl enable --now "${UPDATER_TIMER}.timer" 2>/dev/null
   info "Auto-update ENABLED."
   info "Next run: $(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | tail -2 | head -1 || echo 'check systemctl list-timers')"
@@ -488,8 +522,8 @@ do_set_version() {
   if [[ -z "$target_ver" ]]; then
     # Interactive mode: show available versions
     info "Fetching available versions …"
-    local versions
-    versions=$(fetch_available_versions)
+    local versions=""
+    versions=$(fetch_available_versions) || true
 
     if [[ -z "$versions" ]]; then
       err "Could not fetch version list."
@@ -551,12 +585,13 @@ do_set_version() {
   info "Restarting container …"
   docker compose up -d --force-recreate
 
-  # If pinned to specific version, warn about auto-update conflict
+  # If pinned to specific version, offer to disable auto-update (it would be a no-op anyway)
   if [[ "$target_ver" != "latest" ]]; then
     if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
       echo ""
       warn "Auto-update is currently ENABLED."
-      warn "It may override your pinned version on next update cycle."
+      warn "With a pinned version, auto-update will only re-pull ${target_ver} (no-op)."
+      warn "To receive new versions, switch to 'latest' or disable the timer."
       ask "Disable auto-update? [Y/n]:"
       read -r disable_update
       disable_update=${disable_update:-Y}
@@ -580,7 +615,7 @@ if [[ "${1:-}" == "--update-status" ]]; then do_update_status; fi
 if [[ "${1:-}" == "--set-version" ]]; then do_set_version "$@"; fi
 if [[ "${1:-}" == "--list-versions" ]]; then
   info "Fetching available versions from Docker Hub …"
-  versions=$(fetch_available_versions)
+  versions=$(fetch_available_versions) || true
   if [[ -z "$versions" ]]; then
     err "Could not fetch version list."
     exit 1
@@ -875,9 +910,11 @@ download "${CONFIG_URL}/${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_F
 info "Downloading template: ${COMPOSE_FILE} …"
 download "${CONFIG_URL}/${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
 
-# Set permissions so the container's non-root user can modify the config
-chmod 777 "${INSTALL_DIR}/${CONFIG_DIR}"
-chmod 666 "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
+# Set permissions so the container's non-root user (UID 65534) can modify the config
+# for atomic writes (.tmp + rename). Using 65534 (nobody/nonroot) instead of world-writable.
+chown -R 65534:65534 "${INSTALL_DIR}/${CONFIG_DIR}"
+chmod 755 "${INSTALL_DIR}/${CONFIG_DIR}"
+chmod 644 "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 
 # ── pin selected version in docker-compose.yml ───────────────────────
 info "Pinning image version: ${DOCKER_IMAGE}:${SELECTED_VERSION}"
