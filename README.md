@@ -37,8 +37,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/civisrom/mt-docker/main/inst
 | Порт сервера | Порт telemt в host mode (реальный порт на хосте) | `443` |
 | Announce IP | Публичный IP сервера (автоопределение через ifconfig.me) | auto-detect |
 | TLS-домен | Домен для TLS-маскировки (fake-TLS) | `www.google.com` |
+| Версия образа | Конкретная версия Docker-образа или `latest` | `latest` |
 | Systemd-служба | Создать systemd-юнит для автозапуска | `Y` |
-| Авто-обновление | Ежедневный таймер обновления образа (04:00) | `Y` |
+| Авто-обновление | Ежедневный таймер обновления образа (04:00) | `Y` (при `latest`), `N` (при пиннинге) |
 
 ## Режим работы
 
@@ -81,6 +82,37 @@ cd /opt/telemt && sudo docker compose pull && sudo docker compose up -d --force-
 
 # Проверить таймер авто-обновления
 sudo systemctl list-timers telemt-compose-update.timer
+```
+
+## Управление версиями
+
+```bash
+# Показать доступные версии
+sudo bash install-mtproto.sh --list-versions
+
+# Переключиться на конкретную версию (интерактивно)
+sudo bash install-mtproto.sh --set-version
+
+# Переключиться на конкретную версию (напрямую)
+sudo bash install-mtproto.sh --set-version 3.3.27
+
+# Показать текущую версию и статус обновлений
+sudo bash install-mtproto.sh --update-status
+```
+
+При выборе конкретной версии (не `latest`) скрипт автоматически предложит отключить авто-обновление, чтобы таймер не перезаписал выбранную версию.
+
+## Управление авто-обновлениями
+
+```bash
+# Отключить авто-обновление
+sudo bash install-mtproto.sh --update-disable
+
+# Включить авто-обновление
+sudo bash install-mtproto.sh --update-enable
+
+# Проверить статус
+sudo bash install-mtproto.sh --update-status
 ```
 
 ## Удаление

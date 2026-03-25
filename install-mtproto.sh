@@ -6,6 +6,11 @@
 # Usage:
 #   bash install-mtproto.sh              # interactive install
 #   bash install-mtproto.sh --uninstall  # remove everything
+#   bash install-mtproto.sh --list-versions    # show available versions
+#   bash install-mtproto.sh --set-version [V]  # switch to version V (interactive if V omitted)
+#   bash install-mtproto.sh --update-status    # show current version & update state
+#   bash install-mtproto.sh --update-enable    # enable auto-update timer
+#   bash install-mtproto.sh --update-disable   # disable auto-update timer
 #
 set -euo pipefail
 
@@ -20,6 +25,10 @@ UPDATER_TIMER="${SERVICE_NAME}-update"
 
 REPO_RAW="https://raw.githubusercontent.com/civisrom/mt-docker/main"
 CONFIG_URL="${REPO_RAW}/config"
+
+DOCKER_IMAGE="whn0thacked/telemt-docker"
+DOCKER_HUB_API="https://hub.docker.com/v2/repositories/${DOCKER_IMAGE}/tags"
+VERSION_FILE="${INSTALL_DIR}/.telemt-version"
 
 # ── colours / helpers ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -320,7 +329,268 @@ do_uninstall() {
   exit 0
 }
 
+# ── fetch available versions from Docker Hub ─────────────────────────
+# Returns list of semver tags (e.g., 3.3.27, 3.3.28, ...) sorted newest first
+fetch_available_versions() {
+  local api_url="${DOCKER_HUB_API}/?page_size=50&ordering=last_updated"
+  local raw_json=""
+
+  if command -v curl &>/dev/null; then
+    raw_json=$(curl -fsSL --connect-timeout 10 --max-time 20 "$api_url" 2>/dev/null || true)
+  elif command -v wget &>/dev/null; then
+    raw_json=$(wget -qO- --timeout=20 "$api_url" 2>/dev/null || true)
+  fi
+
+  if [[ -z "$raw_json" ]]; then
+    return 1
+  fi
+
+  # Extract semver tags (X.Y.Z), exclude pre-releases, cache, commit hashes
+  if command -v jq &>/dev/null; then
+    echo "$raw_json" | jq -r '.results[].name' 2>/dev/null \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -t. -k1,1rn -k2,2rn -k3,3rn
+  else
+    # Fallback: parse JSON without jq using grep/sed
+    echo "$raw_json" \
+      | grep -oP '"name"\s*:\s*"\K[^"]+' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -t. -k1,1rn -k2,2rn -k3,3rn
+  fi
+}
+
+# Display version selection menu and set SELECTED_VERSION
+select_version() {
+  header "Version selection"
+
+  info "Fetching available versions from Docker Hub …"
+  local versions
+  versions=$(fetch_available_versions)
+
+  if [[ -z "$versions" ]]; then
+    warn "Could not fetch version list. Using 'latest'."
+    SELECTED_VERSION="latest"
+    return
+  fi
+
+  # Convert to array
+  local -a ver_array=()
+  while IFS= read -r v; do
+    ver_array+=("$v")
+  done <<< "$versions"
+
+  local total=${#ver_array[@]}
+  if (( total == 0 )); then
+    warn "No versions found. Using 'latest'."
+    SELECTED_VERSION="latest"
+    return
+  fi
+
+  echo ""
+  printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
+  printf "  %-4s  %-14s\n" "---" "-----------"
+  printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (always newest)\n" "0" "latest"
+
+  local i
+  for (( i=0; i<total && i<15; i++ )); do
+    if (( i == 0 )); then
+      printf "  ${CYAN}%-4s  %-14s${NC}  (newest release)\n" "$((i+1))" "${ver_array[$i]}"
+    else
+      printf "  %-4s  %-14s\n" "$((i+1))" "${ver_array[$i]}"
+    fi
+  done
+
+  if (( total > 15 )); then
+    info "  … and $((total - 15)) more (showing top 15)"
+  fi
+
+  echo ""
+  ask "Select version [0=latest]:"
+  read -r ver_choice
+  ver_choice=${ver_choice:-0}
+
+  if [[ "$ver_choice" == "0" ]]; then
+    SELECTED_VERSION="latest"
+  elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= total && ver_choice <= 15 )); then
+    SELECTED_VERSION="${ver_array[$((ver_choice - 1))]}"
+  else
+    warn "Invalid choice. Using 'latest'."
+    SELECTED_VERSION="latest"
+  fi
+
+  info "Selected version: ${SELECTED_VERSION}"
+}
+
+# ── update management: enable/disable/status ─────────────────────────
+do_update_enable() {
+  need_root
+  if [[ ! -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
+    err "Auto-update timer not found. Run install first."
+    exit 1
+  fi
+  systemctl enable --now "${UPDATER_TIMER}.timer" 2>/dev/null
+  info "Auto-update ENABLED."
+  info "Next run: $(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | tail -2 | head -1 || echo 'check systemctl list-timers')"
+  exit 0
+}
+
+do_update_disable() {
+  need_root
+  if [[ ! -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
+    err "Auto-update timer not found."
+    exit 1
+  fi
+  systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
+  systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+  info "Auto-update DISABLED."
+  exit 0
+}
+
+do_update_status() {
+  echo ""
+  header "Update status"
+
+  # Current image version
+  local cur_img
+  cur_img=$(docker inspect --format '{{.Config.Image}}' telemt 2>/dev/null || echo "unknown")
+  info "Current image  : ${cur_img}"
+
+  # Pinned version from file
+  if [[ -f "${VERSION_FILE}" ]]; then
+    info "Pinned version : $(cat "${VERSION_FILE}")"
+  else
+    info "Pinned version : not set (using compose default)"
+  fi
+
+  # Timer status
+  if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
+    printf "${GREEN}[INFO]${NC}  Auto-update   : ${GREEN}ENABLED${NC}\n"
+    local next
+    next=$(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | grep "${UPDATER_TIMER}" || echo "")
+    if [[ -n "$next" ]]; then
+      info "Timer info     : ${next}"
+    fi
+  elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
+    printf "${YELLOW}[INFO]${NC}  Auto-update   : ${YELLOW}DISABLED${NC}\n"
+  else
+    info "Auto-update    : not installed"
+  fi
+
+  echo ""
+  exit 0
+}
+
+# Set specific version in running installation
+do_set_version() {
+  need_root
+  local target_ver="${2:-}"
+
+  if [[ -z "$target_ver" ]]; then
+    # Interactive mode: show available versions
+    info "Fetching available versions …"
+    local versions
+    versions=$(fetch_available_versions)
+
+    if [[ -z "$versions" ]]; then
+      err "Could not fetch version list."
+      exit 1
+    fi
+
+    local -a ver_array=()
+    while IFS= read -r v; do
+      ver_array+=("$v")
+    done <<< "$versions"
+
+    echo ""
+    printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
+    printf "  %-4s  %-14s\n" "---" "-----------"
+    printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (always newest)\n" "0" "latest"
+
+    local i total=${#ver_array[@]}
+    for (( i=0; i<total && i<15; i++ )); do
+      printf "  %-4s  %-14s\n" "$((i+1))" "${ver_array[$i]}"
+    done
+    echo ""
+
+    ask "Select version [0=latest]:"
+    read -r ver_choice
+    ver_choice=${ver_choice:-0}
+
+    if [[ "$ver_choice" == "0" ]]; then
+      target_ver="latest"
+    elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= total && ver_choice <= 15 )); then
+      target_ver="${ver_array[$((ver_choice - 1))]}"
+    else
+      err "Invalid choice."
+      exit 1
+    fi
+  fi
+
+  info "Switching to version: ${target_ver}"
+
+  # Update docker-compose.yml image tag
+  if [[ ! -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
+    err "Compose file not found: ${INSTALL_DIR}/${COMPOSE_FILE}"
+    exit 1
+  fi
+
+  sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${target_ver}|" \
+    "${INSTALL_DIR}/${COMPOSE_FILE}"
+
+  # Save pinned version
+  echo "${target_ver}" > "${VERSION_FILE}"
+
+  # Pull and restart
+  cd "${INSTALL_DIR}" || exit 1
+  info "Pulling image …"
+  if ! docker compose pull; then
+    err "Failed to pull ${DOCKER_IMAGE}:${target_ver}"
+    exit 1
+  fi
+
+  info "Restarting container …"
+  docker compose up -d --force-recreate
+
+  # If pinned to specific version, warn about auto-update conflict
+  if [[ "$target_ver" != "latest" ]]; then
+    if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
+      echo ""
+      warn "Auto-update is currently ENABLED."
+      warn "It may override your pinned version on next update cycle."
+      ask "Disable auto-update? [Y/n]:"
+      read -r disable_update
+      disable_update=${disable_update:-Y}
+      if [[ "${disable_update,,}" =~ ^y ]]; then
+        systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
+        systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+        info "Auto-update disabled."
+      fi
+    fi
+  fi
+
+  info "Done. Running version: ${target_ver}"
+  exit 0
+}
+
+# ── CLI subcommands ───────────────────────────────────────────────────
 if [[ "${1:-}" == "--uninstall" ]]; then do_uninstall; fi
+if [[ "${1:-}" == "--update-enable" ]]; then do_update_enable; fi
+if [[ "${1:-}" == "--update-disable" ]]; then do_update_disable; fi
+if [[ "${1:-}" == "--update-status" ]]; then do_update_status; fi
+if [[ "${1:-}" == "--set-version" ]]; then do_set_version "$@"; fi
+if [[ "${1:-}" == "--list-versions" ]]; then
+  info "Fetching available versions from Docker Hub …"
+  versions=$(fetch_available_versions)
+  if [[ -z "$versions" ]]; then
+    err "Could not fetch version list."
+    exit 1
+  fi
+  echo ""
+  printf "  ${BOLD}Available versions:${NC}\n"
+  echo "$versions" | head -20
+  echo ""
+  exit 0
+fi
 
 # ══════════════════════════════════════════════════════════════════════════
 # ██  INTERACTIVE CONFIGURATION                                          ██
@@ -529,7 +799,12 @@ done
 MASK_PORT=443
 
 # ─────────────────────────────────────────────────────────────────────────
-# §4  SYSTEMD & AUTO-UPDATE
+# §4  VERSION SELECTION
+# ─────────────────────────────────────────────────────────────────────────
+select_version
+
+# ─────────────────────────────────────────────────────────────────────────
+# §5  SYSTEMD & AUTO-UPDATE
 # ─────────────────────────────────────────────────────────────────────────
 header "Systemd & auto-update"
 
@@ -537,9 +812,18 @@ ask "Create systemd service for auto-start? [Y/n]:"
 read -r CREATE_SERVICE
 CREATE_SERVICE=${CREATE_SERVICE:-Y}
 
-ask "Enable automatic daily image update? [Y/n]:"
-read -r AUTO_UPDATE
-AUTO_UPDATE=${AUTO_UPDATE:-Y}
+# If pinned to a specific version, default auto-update to No
+if [[ "${SELECTED_VERSION}" != "latest" ]]; then
+  warn "You selected a pinned version (${SELECTED_VERSION})."
+  warn "Auto-update would override this — defaulting to disabled."
+  ask "Enable automatic daily image update? [y/N]:"
+  read -r AUTO_UPDATE
+  AUTO_UPDATE=${AUTO_UPDATE:-N}
+else
+  ask "Enable automatic daily image update? [Y/n]:"
+  read -r AUTO_UPDATE
+  AUTO_UPDATE=${AUTO_UPDATE:-Y}
+fi
 
 # ══════════════════════════════════════════════════════════════════════════
 # ██  DEPLOYMENT                                                          ██
@@ -565,6 +849,14 @@ download "${CONFIG_URL}/${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
 # Set permissions so the container's non-root user can modify the config
 chmod 777 "${INSTALL_DIR}/${CONFIG_DIR}"
 chmod 666 "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
+
+# ── pin selected version in docker-compose.yml ───────────────────────
+info "Pinning image version: ${DOCKER_IMAGE}:${SELECTED_VERSION}"
+sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${SELECTED_VERSION}|" \
+  "${INSTALL_DIR}/${COMPOSE_FILE}"
+
+# Save version info for management commands
+echo "${SELECTED_VERSION}" > "${VERSION_FILE}"
 
 # ── patch telemt.toml ──────────────────────────────────────────────────
 info "Configuring ${CONFIG_FILE} …"
@@ -722,6 +1014,7 @@ info "Install dir  : ${INSTALL_DIR}"
 info "Config dir   : ${INSTALL_DIR}/${CONFIG_DIR}"
 info "Config       : ${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 info "Compose      : ${INSTALL_DIR}/${COMPOSE_FILE}"
+info "Image version: ${DOCKER_IMAGE}:${SELECTED_VERSION}"
 info "Network      : host mode (no Docker port mapping)"
 info "Listen port  : ${PORT}"
 info "Announce IP  : ${ANNOUNCE_IP}"
@@ -763,6 +1056,13 @@ info "Logs        : docker logs telemt --tail=50 -f"
 info "Config      : nano ${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 info "Restart     : docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} up -d --force-recreate"
 info "Uninstall   : bash install-mtproto.sh --uninstall"
+echo ""
+header "Version management"
+info "List versions   : bash install-mtproto.sh --list-versions"
+info "Switch version  : bash install-mtproto.sh --set-version [VERSION]"
+info "Update status   : bash install-mtproto.sh --update-status"
+info "Enable updates  : bash install-mtproto.sh --update-enable"
+info "Disable updates : bash install-mtproto.sh --update-disable"
 
 # ── nftables reminder ──────────────────────────────────────────────────
 echo ""
