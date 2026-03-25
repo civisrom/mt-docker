@@ -677,15 +677,15 @@ if detect_existing_install; then
 
   # Show current version & auto-update status
   echo ""
-  local cur_ver="unknown"
+  cur_ver="unknown"
   if [[ -f "${VERSION_FILE}" ]]; then
     cur_ver=$(cat "${VERSION_FILE}" 2>/dev/null || echo "unknown")
   elif [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
-    cur_ver=$(grep -oP "image:\s*${DOCKER_IMAGE}:\K.*" "${INSTALL_DIR}/${COMPOSE_FILE}" 2>/dev/null || echo "unknown")
+    cur_ver=$(sed -n "s/.*image:[[:space:]]*${DOCKER_IMAGE}:\(.*\)/\1/p" "${INSTALL_DIR}/${COMPOSE_FILE}" 2>/dev/null || echo "unknown")
   fi
   info "  Current version   : ${DOCKER_IMAGE}:${cur_ver}"
 
-  local update_state="not installed"
+  update_state="not installed"
   if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
     update_state="${GREEN}ENABLED${NC}"
   elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
@@ -711,40 +711,40 @@ if detect_existing_install; then
       echo ""
 
       info "Fetching available versions from Docker Hub …"
-      local versions=""
-      versions=$(fetch_available_versions) || true
+      mgmt_versions=""
+      mgmt_versions=$(fetch_available_versions) || true
 
-      if [[ -z "$versions" ]]; then
+      if [[ -z "$mgmt_versions" ]]; then
         err "Could not fetch version list."
         exit 1
       fi
 
-      local -a ver_array=()
+      mgmt_ver_array=()
       while IFS= read -r v; do
-        ver_array+=("$v")
-      done <<< "$versions"
+        mgmt_ver_array+=("$v")
+      done <<< "$mgmt_versions"
 
-      local total=${#ver_array[@]}
+      mgmt_total=${#mgmt_ver_array[@]}
       echo ""
       printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
       printf "  %-4s  %-14s\n" "---" "-----------"
       printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (always newest)\n" "0" "latest"
 
-      local i
-      for (( i=0; i<total && i<15; i++ )); do
-        local marker=""
-        if [[ "${ver_array[$i]}" == "$cur_ver" ]]; then
+      mgmt_i=0
+      for (( mgmt_i=0; mgmt_i<mgmt_total && mgmt_i<15; mgmt_i++ )); do
+        marker=""
+        if [[ "${mgmt_ver_array[$mgmt_i]}" == "$cur_ver" ]]; then
           marker="  <-- current"
         fi
-        if (( i == 0 )); then
-          printf "  ${CYAN}%-4s  %-14s${NC}  (newest release)%s\n" "$((i+1))" "${ver_array[$i]}" "$marker"
+        if (( mgmt_i == 0 )); then
+          printf "  ${CYAN}%-4s  %-14s${NC}  (newest release)%s\n" "$((mgmt_i+1))" "${mgmt_ver_array[$mgmt_i]}" "$marker"
         else
-          printf "  %-4s  %-14s%s\n" "$((i+1))" "${ver_array[$i]}" "$marker"
+          printf "  %-4s  %-14s%s\n" "$((mgmt_i+1))" "${mgmt_ver_array[$mgmt_i]}" "$marker"
         fi
       done
 
-      if (( total > 15 )); then
-        info "  … and $((total - 15)) more (showing top 15)"
+      if (( mgmt_total > 15 )); then
+        info "  … and $((mgmt_total - 15)) more (showing top 15)"
       fi
 
       echo ""
@@ -752,11 +752,11 @@ if detect_existing_install; then
       read -r ver_choice
       ver_choice=${ver_choice:-0}
 
-      local target_ver=""
+      target_ver=""
       if [[ "$ver_choice" == "0" ]]; then
         target_ver="latest"
-      elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= total && ver_choice <= 15 )); then
-        target_ver="${ver_array[$((ver_choice - 1))]}"
+      elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= mgmt_total && ver_choice <= 15 )); then
+        target_ver="${mgmt_ver_array[$((ver_choice - 1))]}"
       else
         err "Invalid choice."
         exit 1
@@ -811,7 +811,6 @@ if detect_existing_install; then
 
       if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
         printf "  Auto-update is currently: ${GREEN}${BOLD}ENABLED${NC}\n"
-        local next_run
         next_run=$(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | grep "${UPDATER_TIMER}" || echo "")
         if [[ -n "$next_run" ]]; then
           info "  ${next_run}"
@@ -833,7 +832,6 @@ if detect_existing_install; then
 
         # Warn if version is pinned
         if [[ -f "${VERSION_FILE}" ]]; then
-          local pinned
           pinned=$(cat "${VERSION_FILE}" 2>/dev/null || true)
           if [[ -n "$pinned" && "$pinned" != "latest" ]]; then
             warn "Version is pinned to '${pinned}'."
