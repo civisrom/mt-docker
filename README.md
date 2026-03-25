@@ -84,36 +84,63 @@ cd /opt/telemt && sudo docker compose pull && sudo docker compose up -d --force-
 sudo systemctl list-timers telemt-compose-update.timer
 ```
 
-## Управление версиями
+## Управление версиями и обновлениями
+
+### CLI-команды
+
+| Команда | Описание |
+|---------|----------|
+| `--list-versions` | Показать доступные версии из Docker Hub |
+| `--set-version [V]` | Переключиться на версию (интерактивно или напрямую) |
+| `--update-status` | Текущая версия + статус авто-обновлений |
+| `--update-enable` | Включить авто-обновление |
+| `--update-disable` | Отключить авто-обновление |
+
+Все команды можно запускать как напрямую, так и через bootstrap-скрипт (без повторной установки зависимостей):
+
+```bash
+# Напрямую (если скрипт уже скачан)
+sudo bash install-mtproto.sh --list-versions
+
+# Через bootstrap (скачает скрипт автоматически)
+bash <(curl -fsSL https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh) --list-versions
+```
+
+### Выбор версии
 
 ```bash
 # Показать доступные версии
 sudo bash install-mtproto.sh --list-versions
 
-# Переключиться на конкретную версию (интерактивно)
+# Переключиться интерактивно (покажет список и спросит выбор)
 sudo bash install-mtproto.sh --set-version
 
-# Переключиться на конкретную версию (напрямую)
+# Переключиться на конкретную версию напрямую
 sudo bash install-mtproto.sh --set-version 3.3.27
 
-# Показать текущую версию и статус обновлений
-sudo bash install-mtproto.sh --update-status
+# Вернуться на latest
+sudo bash install-mtproto.sh --set-version latest
 ```
 
-При выборе конкретной версии (не `latest`) скрипт автоматически предложит отключить авто-обновление, чтобы таймер не перезаписал выбранную версию.
-
-## Управление авто-обновлениями
+### Управление авто-обновлениями
 
 ```bash
+# Проверить статус (текущая версия, пиннинг, состояние таймера)
+sudo bash install-mtproto.sh --update-status
+
 # Отключить авто-обновление
 sudo bash install-mtproto.sh --update-disable
 
 # Включить авто-обновление
 sudo bash install-mtproto.sh --update-enable
-
-# Проверить статус
-sudo bash install-mtproto.sh --update-status
 ```
+
+### Умная логика
+
+- **При установке**: если выбрана конкретная версия (не `latest`), авто-обновление по умолчанию **отключается**
+- **При `--set-version`**: если версия запинена и авто-обновление включено — скрипт объяснит, что таймер будет бесполезно тянуть тот же тег, и предложит отключить его
+- **При `--update-enable`**: если версия запинена — скрипт предложит переключиться на `latest`, чтобы обновления действительно работали
+- **Авто-обновление** запускается ежедневно в ~04:00 (с рандомизацией ±30 мин) и тянет тег, указанный в `docker-compose.yml`
 
 ## Удаление
 
