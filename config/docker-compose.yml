@@ -7,12 +7,10 @@ services:
     restart: unless-stopped
 
     # ---------------------------------------------------------------
-    # Root user requirement for binding privileged ports (<1024)
-    # The default image runs as 'nonroot' to minimize attack vectors.
-    # Uncomment the line below to run as root ONLY if you need to bind
-    # to port 443 and encounter 'os error 13'.
+    # The upstream image runs as a non-root user by default.
+    # Keep it non-root; NET_BIND_SERVICE below is used for low ports
+    # such as 443 where the host kernel requires bind privileges.
     # ---------------------------------------------------------------
-    # user: "root"
 
     # Telemt uses RUST_LOG for verbosity (optional)
     environment:
@@ -46,9 +44,8 @@ services:
 
     # Hardening
     # ---------------------------------------------------------------
-    # If you uncommented `user: "root"` above to bind to port 443,
-    # you MUST comment out the two lines below, as they prevent
-    # gaining the necessary privileges for binding restricted ports.
+    # Keep privilege escalation blocked. The only capability retained
+    # is NET_BIND_SERVICE for binding privileged ports.
     # ---------------------------------------------------------------
     security_opt:
       - no-new-privileges:true

@@ -1,0 +1,18 @@
+[Unit]
+Description=Update Telemt MTProto Docker image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telemt
+ExecStartPre=/usr/bin/docker compose config -q
+ExecStart=/usr/bin/docker compose pull -q
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telemt-compose-update

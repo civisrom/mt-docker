@@ -23,6 +23,9 @@ CONFIG_FILE="telemt.toml"
 SERVICE_FILE="${SERVICE_NAME}.service"
 UPDATER_TIMER="${SERVICE_NAME}-update"
 INSTALL_MARKER=".telemt-installer"
+# Upstream image is built on gcr.io/distroless/static:nonroot.
+NONROOT_UID="65532"
+NONROOT_GID="65532"
 if SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"; then
   :
 else
@@ -600,13 +603,38 @@ select_version() {
   info "Selected version: ${SELECTED_VERSION}"
 }
 
+write_auto_update_units() {
+  if [[ ! -d "${INSTALL_DIR}" ]]; then
+    err "Install directory not found: ${INSTALL_DIR}. Run install first."
+    return 1
+  fi
+  if [[ ! -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
+    err "Compose file not found: ${INSTALL_DIR}/${COMPOSE_FILE}. Run install first."
+    return 1
+  fi
+
+  download_config_template "${UPDATER_TIMER}.service" "/etc/systemd/system/${UPDATER_TIMER}.service"
+  download_config_template "${UPDATER_TIMER}.timer" "/etc/systemd/system/${UPDATER_TIMER}.timer"
+
+  sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}|" \
+    "/etc/systemd/system/${UPDATER_TIMER}.service"
+}
+
+enable_auto_update_timer() {
+  write_auto_update_units || return 1
+  systemctl daemon-reload
+  systemctl enable --now "${UPDATER_TIMER}.timer"
+}
+
+disable_auto_update_timer() {
+  systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
+  systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+  systemctl reset-failed "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service" 2>/dev/null || true
+}
+
 # ── update management: enable/disable/status ─────────────────────────
 do_update_enable() {
   need_root
-  if [[ ! -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
-    err "Auto-update timer not found. Run install first."
-    exit 1
-  fi
 
   # Warn if version is pinned (auto-update would be a no-op)
   if [[ -f "${VERSION_FILE}" ]]; then
@@ -625,7 +653,7 @@ do_update_enable() {
     fi
   fi
 
-  systemctl enable --now "${UPDATER_TIMER}.timer" 2>/dev/null
+  enable_auto_update_timer || exit 1
   info "Auto-update ENABLED."
   info "Next run: $(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | tail -2 | head -1 || echo 'check systemctl list-timers')"
   exit 0
@@ -633,12 +661,12 @@ do_update_enable() {
 
 do_update_disable() {
   need_root
-  if [[ ! -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
-    err "Auto-update timer not found."
-    exit 1
+  if [[ ! -f "/etc/systemd/system/${UPDATER_TIMER}.timer" && \
+        ! -f "/etc/systemd/system/${UPDATER_TIMER}.service" ]]; then
+    info "Auto-update is already DISABLED (timer not installed)."
+    exit 0
   fi
-  systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
-  systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+  disable_auto_update_timer
   info "Auto-update DISABLED."
   exit 0
 }
@@ -738,8 +766,7 @@ do_set_version() {
       read -r disable_update
       disable_update=${disable_update:-Y}
       if [[ "${disable_update,,}" =~ ^y ]]; then
-        systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
-        systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+        disable_auto_update_timer
         info "Auto-update disabled."
       fi
     fi
@@ -923,8 +950,7 @@ if detect_existing_install; then
           read -r disable_upd
           disable_upd=${disable_upd:-Y}
           if [[ "${disable_upd,,}" =~ ^y ]]; then
-            systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
-            systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+            disable_auto_update_timer
             info "Auto-update disabled."
           fi
         fi
@@ -950,8 +976,7 @@ if detect_existing_install; then
         read -r toggle_choice
         toggle_choice=${toggle_choice:-Y}
         if [[ "${toggle_choice,,}" =~ ^y ]]; then
-          systemctl stop "${UPDATER_TIMER}.timer" 2>/dev/null || true
-          systemctl disable "${UPDATER_TIMER}.timer" 2>/dev/null || true
+          disable_auto_update_timer
           info "Auto-update DISABLED."
         else
           info "No changes."
@@ -980,7 +1005,7 @@ if detect_existing_install; then
         read -r toggle_choice
         toggle_choice=${toggle_choice:-Y}
         if [[ "${toggle_choice,,}" =~ ^y ]]; then
-          systemctl enable --now "${UPDATER_TIMER}.timer" 2>/dev/null
+          enable_auto_update_timer || exit 1
           info "Auto-update ENABLED."
         else
           info "No changes."
@@ -991,42 +1016,7 @@ if detect_existing_install; then
         read -r create_timer
         create_timer=${create_timer:-Y}
         if [[ "${create_timer,,}" =~ ^y ]]; then
-          cat > "/etc/systemd/system/${UPDATER_TIMER}.service" <<UPDEOF2
-[Unit]
-Description=Update Telemt MTProto Docker image
-Requires=docker.service
-After=docker.service network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=${INSTALL_DIR}
-ExecStart=/bin/sh -c '\
-  docker compose pull -q && \
-  docker compose up -d --remove-orphans'
-Restart=on-failure
-RestartSec=60
-TimeoutStartSec=300
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=${UPDATER_TIMER}
-UPDEOF2
-
-          cat > "/etc/systemd/system/${UPDATER_TIMER}.timer" <<TMREOF2
-[Unit]
-Description=Daily update for Telemt MTProto Docker image
-
-[Timer]
-OnCalendar=*-*-* 04:00:00
-RandomizedDelaySec=1800
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-TMREOF2
-
-          systemctl daemon-reload
-          systemctl enable --now "${UPDATER_TIMER}.timer"
+          enable_auto_update_timer || exit 1
           info "Auto-update timer created and ENABLED (daily at ~04:00)."
         fi
       fi
@@ -1272,9 +1262,9 @@ download_config_template "${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG
 info "Downloading template: ${COMPOSE_FILE} …"
 download_config_template "${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
 
-# Set permissions so the container's non-root user (UID 65534) can modify the config
-# for atomic writes (.tmp + rename). Using 65534 (nobody/nonroot) instead of world-writable.
-chown -R 65534:65534 "${INSTALL_DIR}/${CONFIG_DIR}"
+# Set permissions so the distroless non-root user can modify the config
+# for atomic writes (.tmp + rename) without making it world-writable.
+chown -R "${NONROOT_UID}:${NONROOT_GID}" "${INSTALL_DIR}/${CONFIG_DIR}"
 chmod 755 "${INSTALL_DIR}/${CONFIG_DIR}"
 chmod 644 "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 
@@ -1318,17 +1308,12 @@ sed -i "/^\[access\.users\]$/r ${users_tmp}" "${CONFIG_PATH}"
 rm -f "$users_tmp"
 trap - EXIT
 
-# ── privileged port handling ───────────────────────────────────────────
-# The upstream image runs as non-root by default. Ports below 1024
-# require root inside the container, so we must enable user: "root"
-# and disable no-new-privileges in docker-compose.yml.
+# ── non-root port handling ─────────────────────────────────────────────
+# The upstream image is non-root by default. Keep the container non-root
+# and rely on NET_BIND_SERVICE for privileged ports where the host kernel
+# requires it.
 if (( PORT < 1024 )); then
-  info "Port ${PORT} is privileged (<1024) — enabling root user in compose."
-  # Uncomment user: "root"
-  sed -i 's|^    # user: "root"|    user: "root"|' "${INSTALL_DIR}/${COMPOSE_FILE}"
-  # Comment out security_opt and no-new-privileges
-  sed -i 's|^    security_opt:$|    # security_opt:|'                          "${INSTALL_DIR}/${COMPOSE_FILE}"
-  sed -i 's|^      - no-new-privileges:true$|    #   - no-new-privileges:true|' "${INSTALL_DIR}/${COMPOSE_FILE}"
+  info "Port ${PORT} is privileged (<1024); keeping non-root container with NET_BIND_SERVICE."
 fi
 
 # ── Note: docker-compose.yml uses network_mode: host ─────────────────
@@ -1351,46 +1336,7 @@ fi
 # ── auto-update timer ──────────────────────────────────────────────────
 if [[ "${AUTO_UPDATE,,}" =~ ^y ]]; then
   info "Creating auto-update timer …"
-
-  cat > "/etc/systemd/system/${UPDATER_TIMER}.service" <<UPDEOF
-[Unit]
-Description=Update Telemt MTProto Docker image
-Requires=docker.service
-After=docker.service network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=${INSTALL_DIR}
-# Pull with timeout and recreate only if the selected image tag changed
-ExecStart=/bin/sh -c '\
-  docker compose pull -q && \
-  docker compose up -d --remove-orphans'
-# Retry on transient network failures
-Restart=on-failure
-RestartSec=60
-# Timeout for pull (large images, slow connections)
-TimeoutStartSec=300
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=${UPDATER_TIMER}
-UPDEOF
-
-  cat > "/etc/systemd/system/${UPDATER_TIMER}.timer" <<TMREOF
-[Unit]
-Description=Daily update for Telemt MTProto Docker image
-
-[Timer]
-OnCalendar=*-*-* 04:00:00
-RandomizedDelaySec=1800
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-TMREOF
-
-  systemctl daemon-reload
-  systemctl enable --now "${UPDATER_TIMER}.timer"
+  enable_auto_update_timer || exit 1
   info "Auto-update timer enabled (daily at ~04:00)."
 fi
 
