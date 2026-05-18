@@ -22,6 +22,12 @@ COMPOSE_FILE="docker-compose.yml"
 CONFIG_FILE="telemt.toml"
 SERVICE_FILE="${SERVICE_NAME}.service"
 UPDATER_TIMER="${SERVICE_NAME}-update"
+INSTALL_MARKER=".telemt-installer"
+if SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"; then
+  :
+else
+  SCRIPT_DIR="$(pwd -P)"
+fi
 
 REPO_RAW="https://raw.githubusercontent.com/civisrom/mt-docker/main"
 CONFIG_URL="${REPO_RAW}/config"
@@ -64,6 +70,35 @@ download() {
   fi
 }
 
+download_config_template() {
+  local name="$1" dest="$2"
+  local local_template="${SCRIPT_DIR}/config/${name}"
+
+  if [[ -f "$local_template" ]]; then
+    cp "$local_template" "$dest"
+  else
+    download "${CONFIG_URL}/${name}" "$dest"
+  fi
+
+  if [[ ! -s "$dest" ]]; then
+    err "Failed to prepare template: ${name}"
+    exit 1
+  fi
+}
+
+install_self_copy() {
+  local dest="${INSTALL_DIR}/install-mtproto.sh"
+  local src="${BASH_SOURCE[0]}"
+
+  if [[ -f "$src" ]]; then
+    cp "$src" "$dest"
+    chmod 755 "$dest"
+  else
+    download "${REPO_RAW}/install-mtproto.sh" "$dest"
+    chmod 755 "$dest"
+  fi
+}
+
 check_deps() {
   local missing=()
   for cmd in docker openssl sed xxd curl; do
@@ -102,8 +137,24 @@ is_valid_ipv4() {
 
 is_valid_domain() {
   local d="$1"
-  # Basic domain validation: alphanumeric, hyphens, dots, 2+ parts
-  [[ "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && [[ "$d" == *.* ]]
+  [[ ${#d} -le 253 ]] || return 1
+  [[ "$d" == *.* ]] || return 1
+  [[ "$d" != *..* ]] || return 1
+
+  local IFS='.'
+  local -a labels
+  read -ra labels <<< "$d"
+  local label
+  for label in "${labels[@]}"; do
+    [[ -n "$label" && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+  done
+  return 0
+}
+
+is_valid_version_tag() {
+  local v="$1"
+  [[ "$v" == "latest" || "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 # Sanitize input: strip dangerous characters for sed usage
@@ -143,6 +194,125 @@ detect_public_ip() {
     fi
   done
   return 1
+}
+
+compose_file_is_telemt() {
+  local compose_path="$1"
+  [[ -f "$compose_path" ]] || return 1
+  grep -Eq "^[[:space:]]*image:[[:space:]]*${DOCKER_IMAGE}:" "$compose_path"
+}
+
+safe_realpath() {
+  local path="$1"
+  if command -v realpath &>/dev/null; then
+    realpath -m "$path" 2>/dev/null
+  else
+    (cd "$(dirname "$path")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")")
+  fi
+}
+
+is_safe_install_dir() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+
+  local dir_real install_real
+  dir_real=$(safe_realpath "$dir")
+  install_real=$(safe_realpath "$INSTALL_DIR")
+
+  [[ -n "$dir_real" && "$dir_real" != "/" ]] || return 1
+  [[ "$dir_real" == "$install_real" ]] || return 1
+
+  [[ -f "${dir}/${INSTALL_MARKER}" ]] && return 0
+  compose_file_is_telemt "${dir}/${COMPOSE_FILE}" && return 0
+  return 1
+}
+
+get_current_version() {
+  if [[ -f "${VERSION_FILE}" ]]; then
+    cat "${VERSION_FILE}" 2>/dev/null || true
+  elif [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
+    sed -n "s|^[[:space:]]*image:[[:space:]]*${DOCKER_IMAGE}:\([^[:space:]]*\).*|\1|p" \
+      "${INSTALL_DIR}/${COMPOSE_FILE}" 2>/dev/null | head -1
+  fi
+}
+
+set_compose_version() {
+  local target_ver="$1"
+  local compose_path="${INSTALL_DIR}/${COMPOSE_FILE}"
+
+  if ! is_valid_version_tag "$target_ver"; then
+    err "Invalid version tag: ${target_ver}. Use 'latest' or X.Y.Z."
+    return 1
+  fi
+  if [[ ! -f "$compose_path" ]]; then
+    err "Compose file not found: ${compose_path}"
+    return 1
+  fi
+  if ! compose_file_is_telemt "$compose_path"; then
+    err "Compose file does not look like a telemt installer compose file: ${compose_path}"
+    return 1
+  fi
+
+  sed -i "s|^[[:space:]]*image:[[:space:]]*${DOCKER_IMAGE}:.*|    image: ${DOCKER_IMAGE}:${target_ver}|" \
+    "$compose_path"
+}
+
+switch_running_version() {
+  local target_ver="$1"
+  local compose_path="${INSTALL_DIR}/${COMPOSE_FILE}"
+  local old_ver=""
+
+  if ! is_valid_version_tag "$target_ver"; then
+    err "Invalid version tag: ${target_ver}. Use 'latest' or X.Y.Z."
+    return 1
+  fi
+  if [[ ! -f "$compose_path" ]]; then
+    err "Compose file not found: ${compose_path}"
+    return 1
+  fi
+  if ! compose_file_is_telemt "$compose_path"; then
+    err "Compose file does not look like a telemt installer compose file: ${compose_path}"
+    return 1
+  fi
+
+  old_ver=$(get_current_version)
+
+  if [[ -z "$old_ver" ]]; then
+    old_ver="unknown"
+  fi
+
+  local backup
+  backup=$(mktemp)
+  cp "$compose_path" "$backup"
+
+  if ! set_compose_version "$target_ver"; then
+    rm -f "$backup"
+    return 1
+  fi
+
+  cd "${INSTALL_DIR}" || {
+    rm -f "$backup"
+    err "Cannot cd to ${INSTALL_DIR}"
+    return 1
+  }
+
+  info "Pulling image …"
+  if ! docker compose pull; then
+    mv "$backup" "$compose_path"
+    err "Failed to pull ${DOCKER_IMAGE}:${target_ver}; compose restored to ${old_ver}."
+    return 1
+  fi
+
+  info "Restarting container …"
+  if ! docker compose up -d --force-recreate; then
+    mv "$backup" "$compose_path"
+    err "Failed to restart container; compose restored to ${old_ver}."
+    return 1
+  fi
+
+  rm -f "$backup"
+  echo "${target_ver}" > "${VERSION_FILE}"
+  return 0
 }
 
 # ── detect existing installation ──────────────────────────────────────
@@ -205,14 +375,13 @@ detect_existing_install() {
   cid=$(docker ps -a --filter 'name=^telemt$' --format '{{.ID}}' 2>/dev/null || true)
   [[ -n "$cid" ]] && _add_container "$cid"
 
-  # ── 4. Containers — by image 'whn0thacked/telemt-docker' ─────────────
-  #       Catches containers even if container_name was changed.
-  local img_cids
-  img_cids=$(docker ps -a --filter 'ancestor=whn0thacked/telemt-docker' --format '{{.ID}}' 2>/dev/null || true)
-  if [[ -n "$img_cids" ]]; then
+  # ── 4. Containers — by installer label ───────────────────────────────
+  local labeled_cids
+  labeled_cids=$(docker ps -a --filter 'label=org.civisrom.mt-docker=telemt' --format '{{.ID}}' 2>/dev/null || true)
+  if [[ -n "$labeled_cids" ]]; then
     while IFS= read -r cid; do
       _add_container "$cid"
-    done <<< "$img_cids"
+    done <<< "$labeled_cids"
   fi
 
   # ── 5. Docker image ──────────────────────────────────────────────────
@@ -233,12 +402,11 @@ detect_existing_install() {
 # ── cleanup existing installation (targeted — telemt only) ────────────
 # Order of operations is critical:
 #   1. Stop systemd units FIRST  (prevents them from restarting containers)
-#   2. docker compose down        (graceful container + network + volume stop)
-#   3. Force-remove leftover containers (by ID — catches renamed ones too)
-#   4. Remove telemt docker images (only whn0thacked/telemt-docker)
-#   5. Prune dangling image layers
+#   2. docker compose down        (only for trusted telemt compose files)
+#   3. Force-remove leftover installer containers
+#   4. Remove current telemt docker tag when it is unused
 #   6. Remove systemd unit files
-#   7. Remove install directories
+#   7. Remove trusted install directories
 cleanup_existing_install() {
   echo ""
   info "── Removing existing telemt MTProto installation ──"
@@ -258,7 +426,11 @@ cleanup_existing_install() {
   #        project networks and anonymous volumes)
   local dir
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
-    if [[ -f "${dir}/${COMPOSE_FILE}" ]]; then
+    if ! is_safe_install_dir "$dir"; then
+      warn "Skipping untrusted install directory during compose cleanup: ${dir}"
+      continue
+    fi
+    if compose_file_is_telemt "${dir}/${COMPOSE_FILE}"; then
       info "Running compose down (${dir}/${COMPOSE_FILE}) …"
       docker compose -f "${dir}/${COMPOSE_FILE}" down \
         --remove-orphans --volumes 2>/dev/null || true
@@ -278,26 +450,15 @@ cleanup_existing_install() {
     done
   fi
 
-  # ── 4. Remove telemt docker images (all tags) ───────────────────────
+  # ── 4. Remove current telemt docker image tag if unused ──────────────
   if $FOUND_IMAGE; then
-    local telemt_image_ids
-    telemt_image_ids=$(docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' \
-      --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null || true)
-    if [[ -n "$telemt_image_ids" ]]; then
-      info "Removing telemt Docker images …"
-      local img_line img_id img_tag
-      while IFS= read -r img_line; do
-        img_id="${img_line%% *}"
-        img_tag="${img_line#* }"
-        info "  removing image: ${img_tag} (${img_id:0:12})"
-        docker rmi -f "$img_id" 2>/dev/null || true
-      done <<< "$telemt_image_ids"
+    local image_tag
+    image_tag=$(get_current_version)
+    if [[ -n "$image_tag" ]]; then
+      info "Removing telemt Docker image if unused: ${DOCKER_IMAGE}:${image_tag}"
+      docker rmi "${DOCKER_IMAGE}:${image_tag}" 2>/dev/null || true
     fi
   fi
-
-  # ── 5. Prune only dangling layers created in the last hour ──────────
-  #        Avoids accidentally removing dangling images from other projects.
-  docker image prune -f --filter "until=1h" 2>/dev/null || true
 
   # ── 6. Remove systemd unit files from disk ──────────────────────────
   if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
@@ -312,8 +473,12 @@ cleanup_existing_install() {
   # ── 7. Remove install directories ───────────────────────────────────
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
     if [[ -d "$dir" ]]; then
+      if ! is_safe_install_dir "$dir"; then
+        warn "Skipping untrusted install directory removal: ${dir}"
+        continue
+      fi
       info "Removing directory: ${dir} …"
-      rm -rf "$dir"
+      rm -rf -- "$dir"
     fi
   done
 
@@ -454,9 +619,7 @@ do_update_enable() {
       read -r switch_latest
       switch_latest=${switch_latest:-Y}
       if [[ "${switch_latest,,}" =~ ^y ]]; then
-        sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:latest|" \
-          "${INSTALL_DIR}/${COMPOSE_FILE}"
-        echo "latest" > "${VERSION_FILE}"
+        switch_running_version "latest" || exit 1
         info "Switched to 'latest'."
       fi
     fi
@@ -498,14 +661,14 @@ do_update_status() {
 
   # Timer status
   if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
-    printf "${GREEN}[INFO]${NC}  Auto-update   : ${GREEN}ENABLED${NC}\n"
+    printf '%b[INFO]%b  Auto-update   : %bENABLED%b\n' "$GREEN" "$NC" "$GREEN" "$NC"
     local next
     next=$(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | grep "${UPDATER_TIMER}" || echo "")
     if [[ -n "$next" ]]; then
       info "Timer info     : ${next}"
     fi
   elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
-    printf "${YELLOW}[INFO]${NC}  Auto-update   : ${YELLOW}DISABLED${NC}\n"
+    printf '%b[INFO]%b  Auto-update   : %bDISABLED%b\n' "$YELLOW" "$NC" "$YELLOW" "$NC"
   else
     info "Auto-update    : not installed"
   fi
@@ -562,28 +725,7 @@ do_set_version() {
 
   info "Switching to version: ${target_ver}"
 
-  # Update docker-compose.yml image tag
-  if [[ ! -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
-    err "Compose file not found: ${INSTALL_DIR}/${COMPOSE_FILE}"
-    exit 1
-  fi
-
-  sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${target_ver}|" \
-    "${INSTALL_DIR}/${COMPOSE_FILE}"
-
-  # Save pinned version
-  echo "${target_ver}" > "${VERSION_FILE}"
-
-  # Pull and restart
-  cd "${INSTALL_DIR}" || exit 1
-  info "Pulling image …"
-  if ! docker compose pull; then
-    err "Failed to pull ${DOCKER_IMAGE}:${target_ver}"
-    exit 1
-  fi
-
-  info "Restarting container …"
-  docker compose up -d --force-recreate
+  switch_running_version "$target_ver" || exit 1
 
   # If pinned to specific version, offer to disable auto-update (it would be a no-op anyway)
   if [[ "$target_ver" != "latest" ]]; then
@@ -621,7 +763,7 @@ if [[ "${1:-}" == "--list-versions" ]]; then
     exit 1
   fi
   echo ""
-  printf "  ${BOLD}Available versions:${NC}\n"
+  printf '  %bAvailable versions:%b\n' "$BOLD" "$NC"
   echo "$versions" | head -20
   echo ""
   exit 0
@@ -691,10 +833,10 @@ if detect_existing_install; then
   elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
     update_state="${YELLOW}DISABLED${NC}"
   fi
-  printf "  ${GREEN}[INFO]${NC}  Auto-update      : ${update_state}\n"
+  printf '  %b[INFO]%b  Auto-update      : %b\n' "$GREEN" "$NC" "$update_state"
 
   echo ""
-  printf "${BOLD}Choose an option:${NC}\n"
+  printf '%bChoose an option:%b\n' "$BOLD" "$NC"
   echo "  1) Change version (show available & switch)"
   echo "  2) Toggle auto-update (enable / disable)"
   echo "  3) Remove existing installation and install fresh"
@@ -769,19 +911,7 @@ if detect_existing_install; then
 
       info "Switching: ${cur_ver} → ${target_ver}"
 
-      sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${target_ver}|" \
-        "${INSTALL_DIR}/${COMPOSE_FILE}"
-      echo "${target_ver}" > "${VERSION_FILE}"
-
-      cd "${INSTALL_DIR}" || exit 1
-      info "Pulling image …"
-      if ! docker compose pull; then
-        err "Failed to pull ${DOCKER_IMAGE}:${target_ver}"
-        exit 1
-      fi
-
-      info "Restarting container …"
-      docker compose up -d --force-recreate
+      switch_running_version "$target_ver" || exit 1
 
       # Smart auto-update handling
       if [[ "$target_ver" != "latest" ]]; then
@@ -810,7 +940,7 @@ if detect_existing_install; then
       header "Auto-update management"
 
       if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
-        printf "  Auto-update is currently: ${GREEN}${BOLD}ENABLED${NC}\n"
+        printf '  Auto-update is currently: %b%bENABLED%b\n' "$GREEN" "$BOLD" "$NC"
         next_run=$(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | grep "${UPDATER_TIMER}" || echo "")
         if [[ -n "$next_run" ]]; then
           info "  ${next_run}"
@@ -827,7 +957,7 @@ if detect_existing_install; then
           info "No changes."
         fi
       elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
-        printf "  Auto-update is currently: ${YELLOW}${BOLD}DISABLED${NC}\n"
+        printf '  Auto-update is currently: %b%bDISABLED%b\n' "$YELLOW" "$BOLD" "$NC"
         echo ""
 
         # Warn if version is pinned
@@ -840,9 +970,7 @@ if detect_existing_install; then
             read -r switch_and_enable
             switch_and_enable=${switch_and_enable:-Y}
             if [[ "${switch_and_enable,,}" =~ ^y ]]; then
-              sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:latest|" \
-                "${INSTALL_DIR}/${COMPOSE_FILE}"
-              echo "latest" > "${VERSION_FILE}"
+              switch_running_version "latest" || exit 1
               info "Switched to 'latest'."
             fi
           fi
@@ -875,8 +1003,7 @@ Type=oneshot
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=/bin/sh -c '\
   docker compose pull -q && \
-  docker compose up -d --remove-orphans && \
-  docker image prune -f'
+  docker compose up -d --remove-orphans'
 Restart=on-failure
 RestartSec=60
 TimeoutStartSec=300
@@ -947,7 +1074,7 @@ while true; do
   fi
 
   echo ""
-  printf "  ${BOLD}Secret for '${uname}':${NC}\n"
+  printf "  %bSecret for '%s':%b\n" "$BOLD" "$uname" "$NC"
   echo "  1) Generate automatically (random 32-hex)"
   echo "  2) Enter custom secret (32 hex characters)"
   echo ""
@@ -1127,12 +1254,23 @@ mkdir -p "${INSTALL_DIR}"
 info "Creating ${INSTALL_DIR}/${CONFIG_DIR} …"
 mkdir -p "${INSTALL_DIR}/${CONFIG_DIR}"
 
+cat > "${INSTALL_DIR}/${INSTALL_MARKER}" <<MARKER
+name=telemt
+script=mt-docker
+compose=${COMPOSE_FILE}
+config_dir=${CONFIG_DIR}
+image=${DOCKER_IMAGE}
+MARKER
+
+info "Installing management script copy …"
+install_self_copy
+
 # ── download templates from repo config/ ───────────────────────────────
 info "Downloading template: ${CONFIG_FILE} …"
-download "${CONFIG_URL}/${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
+download_config_template "${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 
 info "Downloading template: ${COMPOSE_FILE} …"
-download "${CONFIG_URL}/${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
+download_config_template "${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
 
 # Set permissions so the container's non-root user (UID 65534) can modify the config
 # for atomic writes (.tmp + rename). Using 65534 (nobody/nonroot) instead of world-writable.
@@ -1200,7 +1338,7 @@ fi
 # ── systemd service ────────────────────────────────────────────────────
 if [[ "${CREATE_SERVICE,,}" =~ ^y ]]; then
   info "Downloading template: ${SERVICE_FILE} …"
-  download "${CONFIG_URL}/${SERVICE_FILE}" "/etc/systemd/system/${SERVICE_FILE}"
+  download_config_template "${SERVICE_FILE}" "/etc/systemd/system/${SERVICE_FILE}"
 
   # patch WorkingDirectory in case INSTALL_DIR differs from default
   sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}|" "/etc/systemd/system/${SERVICE_FILE}"
@@ -1224,11 +1362,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=${INSTALL_DIR}
-# Pull with timeout, recreate only if image changed, prune old images
+# Pull with timeout and recreate only if the selected image tag changed
 ExecStart=/bin/sh -c '\
   docker compose pull -q && \
-  docker compose up -d --remove-orphans && \
-  docker image prune -f'
+  docker compose up -d --remove-orphans'
 # Retry on transient network failures
 Restart=on-failure
 RestartSec=60
@@ -1273,32 +1410,52 @@ if ! docker compose up -d; then
   exit 1
 fi
 
-# ── wait for container to be healthy ──────────────────────────────────
+# ── wait for container to be running ──────────────────────────────────
 info "Waiting for telemt to start …"
-sleep 2
-if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'telemt'; then
+container_running=false
+for _ in {1..15}; do
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'telemt'; then
+    container_running=true
+    break
+  fi
+  sleep 2
+done
+
+if $container_running; then
   info "Container 'telemt' is running."
 else
-  warn "Container may not have started properly. Check: docker logs telemt"
+  err "Container 'telemt' did not start. Check: docker logs telemt"
+  exit 1
 fi
 
 # ── verify port is listening ──────────────────────────────────────────
 if command -v ss &>/dev/null; then
-  if ss -tlnp 2>/dev/null | grep -qE "[[:space:]][^[:space:]]*:${PORT}[[:space:]]"; then
+  port_listening=false
+  for _ in {1..15}; do
+    if ss -tlnp 2>/dev/null | grep -qE "[[:space:]][^[:space:]]*:${PORT}[[:space:]]"; then
+      port_listening=true
+      break
+    fi
+    sleep 2
+  done
+
+  if $port_listening; then
     info "Port ${PORT} is listening — OK"
   else
-    warn "Port ${PORT} does not appear to be listening yet."
-    warn "Check container logs: docker logs telemt"
+    err "Port ${PORT} is not listening. Check container logs: docker logs telemt"
+    exit 1
   fi
+else
+  warn "'ss' not found; skipping listen-port verification."
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
 # ██  SUMMARY                                                             ██
 # ══════════════════════════════════════════════════════════════════════════
 echo ""
-printf "${BOLD}════════════════════════════════════════════${NC}\n"
-printf "${GREEN}${BOLD}  Installation complete!${NC}\n"
-printf "${BOLD}════════════════════════════════════════════${NC}\n"
+printf '%b════════════════════════════════════════════%b\n' "$BOLD" "$NC"
+printf '%b%b  Installation complete!%b\n' "$GREEN" "$BOLD" "$NC"
+printf '%b════════════════════════════════════════════%b\n' "$BOLD" "$NC"
 echo ""
 info "Install dir  : ${INSTALL_DIR}"
 info "Config dir   : ${INSTALL_DIR}/${CONFIG_DIR}"
@@ -1345,19 +1502,19 @@ fi
 info "Logs        : docker logs telemt --tail=50 -f"
 info "Config      : nano ${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 info "Restart     : docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} up -d --force-recreate"
-info "Uninstall   : bash install-mtproto.sh --uninstall"
+info "Uninstall   : bash ${INSTALL_DIR}/install-mtproto.sh --uninstall"
 echo ""
 header "Version management"
-info "List versions   : bash install-mtproto.sh --list-versions"
-info "Switch version  : bash install-mtproto.sh --set-version [VERSION]"
-info "Update status   : bash install-mtproto.sh --update-status"
-info "Enable updates  : bash install-mtproto.sh --update-enable"
-info "Disable updates : bash install-mtproto.sh --update-disable"
+info "List versions   : bash ${INSTALL_DIR}/install-mtproto.sh --list-versions"
+info "Switch version  : bash ${INSTALL_DIR}/install-mtproto.sh --set-version [VERSION]"
+info "Update status   : bash ${INSTALL_DIR}/install-mtproto.sh --update-status"
+info "Enable updates  : bash ${INSTALL_DIR}/install-mtproto.sh --update-enable"
+info "Disable updates : bash ${INSTALL_DIR}/install-mtproto.sh --update-disable"
 
 # ── nftables reminder ──────────────────────────────────────────────────
 echo ""
-printf "${YELLOW}${BOLD}⚠  FIREWALL REMINDER:${NC}\n"
-printf "${YELLOW}   Make sure your nftables config allows traffic on port ${PORT}.${NC}\n"
-printf "${YELLOW}   Check: define TELEMT_PORT = ${PORT}${NC}\n"
-printf "${YELLOW}   Apply: nft -f /etc/nftables.conf${NC}\n"
+printf '%b%b⚠  FIREWALL REMINDER:%b\n' "$YELLOW" "$BOLD" "$NC"
+printf '%b   Make sure your nftables config allows traffic on port %s.%b\n' "$YELLOW" "$PORT" "$NC"
+printf '%b   Check: define TELEMT_PORT = %s%b\n' "$YELLOW" "$PORT" "$NC"
+printf '%b   Apply: nft -f /etc/nftables.conf%b\n' "$YELLOW" "$NC"
 echo ""

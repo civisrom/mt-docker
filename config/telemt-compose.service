@@ -12,8 +12,6 @@ WorkingDirectory=/opt/telemt
 ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do docker info >/dev/null 2>&1 && break || sleep 3; done'
 # Validate docker-compose.yml configuration
 ExecStartPre=/usr/bin/docker compose config -q
-# Pull latest images before starting
-ExecStartPre=-/usr/bin/docker compose pull -q
 # Start containers
 ExecStart=/usr/bin/docker compose up -d --wait
 # Reload containers configuration

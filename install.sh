@@ -24,15 +24,10 @@ ask()   { printf "${CYAN}[?]${NC}    %s " "$*"; }
 
 REPO_RAW="https://raw.githubusercontent.com/civisrom/mt-docker/main"
 
-# ── root check ──────────────────────────────────────────────────────────
-if [[ $EUID -ne 0 ]]; then
-  err "This script must be run as root (or with sudo)."
-  exit 1
-fi
-
 # ── detect distro ──────────────────────────────────────────────────────
 detect_distro() {
   if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
     . /etc/os-release
     DISTRO_ID="${ID,,}"
   else
@@ -40,9 +35,6 @@ detect_distro() {
     exit 1
   fi
 }
-
-detect_distro
-info "Detected distro: ${DISTRO_ID}"
 
 # ── fast path: management subcommands (skip package install & Docker menu) ──
 # These don't need full bootstrap — just download and run install-mtproto.sh
@@ -82,6 +74,15 @@ for _fpc in "${_fast_path_commands[@]}"; do
     exit 0
   fi
 done
+
+# ── root check ──────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+  err "This script must be run as root (or with sudo)."
+  exit 1
+fi
+
+detect_distro
+info "Detected distro: ${DISTRO_ID}"
 
 # ── install system packages ────────────────────────────────────────────
 install_packages() {
@@ -130,11 +131,11 @@ install_packages() {
       ;;
     *)
       warn "Unknown distro '${DISTRO_ID}'. Trying apt-get …"
-      apt-get update -qq && apt-get install -y -qq \
-        openssl curl wget ca-certificates gnupg lsb-release jq sed xxd || {
+      if ! { apt-get update -qq && apt-get install -y -qq \
+        openssl curl wget ca-certificates gnupg lsb-release jq sed xxd; }; then
         err "Could not install packages. Install manually: openssl curl wget ca-certificates jq sed xxd"
         exit 1
-      }
+      fi
       ;;
   esac
   info "System packages — OK"
@@ -151,7 +152,7 @@ install_docker_menu() {
   if docker compose version &>/dev/null; then compose_installed=true; fi
 
   echo ""
-  printf "${BOLD}── Docker installation ──${NC}\n"
+  printf '%b── Docker installation ──%b\n' "$BOLD" "$NC"
   echo ""
 
   if $docker_installed; then
@@ -167,7 +168,7 @@ install_docker_menu() {
   fi
 
   echo ""
-  printf "${BOLD}Choose an option:${NC}\n"
+  printf '%bChoose an option:%b\n' "$BOLD" "$NC"
   echo "  1) Install Docker CE + all components (official get.docker.com script)"
   echo "  2) Skip Docker installation (already installed / will install manually)"
   echo ""

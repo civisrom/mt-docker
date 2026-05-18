@@ -2,6 +2,8 @@ services:
   telemt:
     image: whn0thacked/telemt-docker:latest
     container_name: telemt
+    labels:
+      org.civisrom.mt-docker: "telemt"
     restart: unless-stopped
 
     # ---------------------------------------------------------------
