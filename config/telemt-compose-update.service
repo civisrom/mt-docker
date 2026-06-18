@@ -1,5 +1,5 @@
 [Unit]
-Description=Update Telemt MTProto Docker image
+Description=Rebuild & update Telemt MTProto container (from GHCR source image)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -7,12 +7,13 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/telemt
-ExecStartPre=/usr/bin/docker compose config -q
-ExecStart=/usr/bin/docker compose pull -q
-ExecStart=/usr/bin/docker compose up -d --remove-orphans
+# Авто-обновление делегировано install-mtproto.sh: оно резолвит новейший
+# тег из GHCR (для UPDATE_CHANNEL=latest), правит .env, пересобирает образ
+# и пересоздаёт контейнер. Для UPDATE_CHANNEL=pinned — no-op.
+ExecStart=/opt/telemt/install-mtproto.sh --auto-update
 Restart=on-failure
 RestartSec=60
-TimeoutStartSec=300
+TimeoutStartSec=900
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=telemt-compose-update

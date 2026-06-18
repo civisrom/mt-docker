@@ -1,29 +1,40 @@
 #!/usr/bin/env bash
 #
-# MTProto Proxy (telemt-docker) — main configuration & deploy script
+# MTProto Proxy (telemt) — main configuration & deploy script
 # Called by install.sh (bootstrap) or can be run standalone.
 #
+# Container is BUILT LOCALLY from telemt.dockerfile: the static binary is
+# copied out of the official ghcr.io/telemt/telemt image — no third-party
+# prebuilt image, no manual GitHub Releases parsing.
+#
 # Usage:
-#   bash install-mtproto.sh              # interactive install
-#   bash install-mtproto.sh --uninstall  # remove everything
-#   bash install-mtproto.sh --list-versions    # show available versions
-#   bash install-mtproto.sh --set-version [V]  # switch to version V (interactive if V omitted)
-#   bash install-mtproto.sh --update-status    # show current version & update state
-#   bash install-mtproto.sh --update-enable    # enable auto-update timer
-#   bash install-mtproto.sh --update-disable   # disable auto-update timer
+#   bash install-mtproto.sh               # interactive install
+#   bash install-mtproto.sh --uninstall   # remove everything
+#   bash install-mtproto.sh --rebuild     # rebuild image & recreate container
+#   bash install-mtproto.sh --start|--stop|--restart   # lifecycle
+#   bash install-mtproto.sh --status      # container + service status
+#   bash install-mtproto.sh --logs        # follow container logs
+#   bash install-mtproto.sh --list-versions     # show available GHCR versions
+#   bash install-mtproto.sh --set-version [V]   # switch version (interactive if V omitted)
+#   bash install-mtproto.sh --auto-update       # used by the update timer
+#   bash install-mtproto.sh --update-status     # current version & update state
+#   bash install-mtproto.sh --update-enable     # enable auto-update timer
+#   bash install-mtproto.sh --update-disable    # disable auto-update timer
 #
 set -euo pipefail
 
 # ── defaults ────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/telemt"
-CONFIG_DIR="telemt-config"       # subdirectory for telemt.toml (mounted as volume)
+CONFIG_DIR="telemt-config"       # subdirectory for telemt.toml + data (mounted volume)
 SERVICE_NAME="telemt-compose"
 COMPOSE_FILE="docker-compose.yml"
+DOCKERFILE="telemt.dockerfile"
+ENV_FILE=".env"
 CONFIG_FILE="telemt.toml"
 SERVICE_FILE="${SERVICE_NAME}.service"
 UPDATER_TIMER="${SERVICE_NAME}-update"
 INSTALL_MARKER=".telemt-installer"
-# Upstream image is built on gcr.io/distroless/static:nonroot.
+# telemt runs as non-root (uid 65532) inside the built image.
 NONROOT_UID="65532"
 NONROOT_GID="65532"
 if SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"; then
@@ -35,9 +46,16 @@ fi
 REPO_RAW="https://raw.githubusercontent.com/civisrom/mt-docker/main"
 CONFIG_URL="${REPO_RAW}/config"
 
-DOCKER_IMAGE="whn0thacked/telemt-docker"
-DOCKER_HUB_API="https://hub.docker.com/v2/repositories/${DOCKER_IMAGE}/tags"
-VERSION_FILE="${INSTALL_DIR}/.telemt-version"
+# Source image (official) and locally-built image tag.
+GHCR_IMAGE="ghcr.io/telemt/telemt"
+LOCAL_IMAGE="civisrom/mt-telemt"
+DEFAULT_VERSION="3.4.18"
+ENV_PATH="${INSTALL_DIR}/${ENV_FILE}"
+
+# Dedicated buildx builder: keeps this project's build cache ISOLATED so that
+# --uninstall can drop it with `docker buildx rm` without touching the default
+# builder / other projects' caches (other containers on the host stay intact).
+BUILDER_NAME="mt-docker"
 
 # ── colours / helpers ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -155,15 +173,15 @@ is_valid_domain() {
   return 0
 }
 
+# Concrete semver tag only (no "latest" — build arg must be a real tag).
 is_valid_version_tag() {
   local v="$1"
-  [[ "$v" == "latest" || "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
-# Sanitize input: strip dangerous characters for sed usage
+# Sanitize input: reject shell metacharacters for sed usage
 sanitize_input() {
   local val="$1"
-  # Reject if contains shell metacharacters
   if [[ "$val" == *"|"* || "$val" == *"&"* || "$val" == *";"* || \
         "$val" == *"\`"* || "$val" == *"\$"* || "$val" == *">"* || \
         "$val" == *"<"* || "$val" == *"'"* || "$val" == *"\\"* ]]; then
@@ -190,7 +208,7 @@ detect_public_ip() {
     else
       return 1
     fi
-    ip="${ip%%[[:space:]]*}"  # trim whitespace/newlines
+    ip="${ip%%[[:space:]]*}"
     if is_valid_ipv4 "$ip"; then
       echo "$ip"
       return 0
@@ -199,10 +217,37 @@ detect_public_ip() {
   return 1
 }
 
+# ── .env helpers ───────────────────────────────────────────────────────
+set_env_kv() {
+  local key="$1" val="$2" file="$3"
+  [[ -f "$file" ]] || : > "$file"
+  if grep -qE "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$file"
+  fi
+}
+
+get_env_kv() {
+  local key="$1" file="$2"
+  [[ -f "$file" ]] || return 1
+  grep -m1 -E "^${key}=" "$file" 2>/dev/null | cut -d= -f2- || true
+}
+
+get_current_version() {
+  get_env_kv "TELEMT_VERSION" "$ENV_PATH" || true
+}
+
+get_update_channel() {
+  local ch
+  ch=$(get_env_kv "UPDATE_CHANNEL" "$ENV_PATH" || true)
+  echo "${ch:-latest}"
+}
+
 compose_file_is_telemt() {
   local compose_path="$1"
   [[ -f "$compose_path" ]] || return 1
-  grep -Eq "^[[:space:]]*image:[[:space:]]*${DOCKER_IMAGE}:" "$compose_path"
+  grep -Eq "org\.civisrom\.mt-docker|${LOCAL_IMAGE}:|${DOCKERFILE}" "$compose_path"
 }
 
 safe_realpath() {
@@ -230,108 +275,193 @@ is_safe_install_dir() {
   return 1
 }
 
-get_current_version() {
-  if [[ -f "${VERSION_FILE}" ]]; then
-    cat "${VERSION_FILE}" 2>/dev/null || true
-  elif [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
-    sed -n "s|^[[:space:]]*image:[[:space:]]*${DOCKER_IMAGE}:\([^[:space:]]*\).*|\1|p" \
-      "${INSTALL_DIR}/${COMPOSE_FILE}" 2>/dev/null | head -1
+# ── fetch available versions from GHCR ───────────────────────────────────
+# Lists semver tags of the official ghcr.io/telemt/telemt image using an
+# anonymous pull token (public image). Sorted newest first.
+fetch_available_versions() {
+  local token tags_json
+  token=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+    "https://ghcr.io/token?scope=repository:telemt/telemt:pull" 2>/dev/null \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' || true)
+  [[ -z "$token" ]] && return 1
+
+  tags_json=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+    -H "Authorization: Bearer ${token}" \
+    "https://ghcr.io/v2/telemt/telemt/tags/list" 2>/dev/null || true)
+  [[ -z "$tags_json" ]] && return 1
+
+  echo "$tags_json" \
+    | tr ',' '\n' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+    | sort -u -t. -k1,1rn -k2,2rn -k3,3rn \
+    || true
+}
+
+# Newest concrete semver tag, or empty
+latest_version() {
+  fetch_available_versions 2>/dev/null | head -1
+}
+
+# Display version selection menu and set SELECTED_VERSION (+ SELECTED_CHANNEL)
+select_version() {
+  header "Version selection"
+
+  info "Fetching available versions from GHCR (ghcr.io/telemt/telemt) …"
+  local versions=""
+  versions=$(fetch_available_versions) || true
+
+  if [[ -z "$versions" ]]; then
+    warn "Could not fetch version list. Using default ${DEFAULT_VERSION} (channel: latest)."
+    SELECTED_VERSION="${DEFAULT_VERSION}"
+    SELECTED_CHANNEL="latest"
+    return
+  fi
+
+  local -a ver_array=()
+  while IFS= read -r v; do ver_array+=("$v"); done <<< "$versions"
+  local total=${#ver_array[@]}
+  local newest="${ver_array[0]}"
+
+  echo ""
+  printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
+  printf "  %-4s  %-14s\n" "---" "-----------"
+  printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (track newest, auto-update)\n" "0" "latest"
+
+  local i
+  for (( i=0; i<total && i<15; i++ )); do
+    if (( i == 0 )); then
+      printf "  ${CYAN}%-4s  %-14s${NC}  (newest release)\n" "$((i+1))" "${ver_array[$i]}"
+    else
+      printf "  %-4s  %-14s\n" "$((i+1))" "${ver_array[$i]}"
+    fi
+  done
+  (( total > 15 )) && info "  … and $((total - 15)) more (showing top 15)"
+
+  echo ""
+  ask "Select version [0=latest]:"
+  read -r ver_choice
+  ver_choice=${ver_choice:-0}
+
+  if [[ "$ver_choice" == "0" ]]; then
+    SELECTED_VERSION="${newest}"   # concrete tag, but channel=latest tracks newest
+    SELECTED_CHANNEL="latest"
+  elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= total && ver_choice <= 15 )); then
+    SELECTED_VERSION="${ver_array[$((ver_choice - 1))]}"
+    SELECTED_CHANNEL="pinned"
+  else
+    warn "Invalid choice. Using 'latest'."
+    SELECTED_VERSION="${newest}"
+    SELECTED_CHANNEL="latest"
+  fi
+
+  info "Selected version: ${SELECTED_VERSION} (channel: ${SELECTED_CHANNEL})"
+}
+
+# ── build / lifecycle helpers ────────────────────────────────────────────
+compose() {
+  docker compose -f "${INSTALL_DIR}/${COMPOSE_FILE}" --env-file "${ENV_PATH}" "$@"
+}
+
+# Ensure the dedicated buildx builder exists (isolated build cache).
+# Returns 0 if it can be used, 1 to fall back to the default builder.
+ensure_builder() {
+  command -v docker &>/dev/null || return 1
+  docker buildx version &>/dev/null || return 1
+  if docker buildx inspect "${BUILDER_NAME}" &>/dev/null; then
+    return 0
+  fi
+  if docker buildx create --name "${BUILDER_NAME}" --driver docker-container &>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# Build via the dedicated builder when possible; fall back to the default
+# builder if the dedicated one is unavailable or fails (e.g. cannot pull
+# moby/buildkit on a restricted host). $@ = extra build flags (e.g. --pull).
+compose_build() {
+  if ensure_builder; then
+    if BUILDX_BUILDER="${BUILDER_NAME}" compose build "$@"; then
+      return 0
+    fi
+    warn "Build with dedicated builder '${BUILDER_NAME}' failed; retrying with default builder."
+  fi
+  compose build "$@"
+}
+
+# Rebuild image and recreate the container. $1: extra build flag (e.g. --pull)
+rebuild_stack() {
+  local pull_flag="${1:-}"
+  cd "${INSTALL_DIR}" || { err "Cannot cd to ${INSTALL_DIR}"; return 1; }
+  info "Building image (${LOCAL_IMAGE}:$(get_current_version)) …"
+  # shellcheck disable=SC2086
+  compose_build ${pull_flag} || return 1
+  info "Recreating container …"
+  compose up -d --force-recreate --remove-orphans || return 1
+  return 0
+}
+
+# Remove the dedicated builder and ITS build cache only (safe: does not touch
+# the default builder or other projects' caches).
+remove_builder() {
+  command -v docker &>/dev/null || return 0
+  docker buildx version &>/dev/null || return 0
+  if docker buildx inspect "${BUILDER_NAME}" &>/dev/null; then
+    info "Removing dedicated buildx builder '${BUILDER_NAME}' (isolated build cache) …"
+    docker buildx rm -f "${BUILDER_NAME}" 2>/dev/null || true
   fi
 }
 
-set_compose_version() {
-  local target_ver="$1"
-  local compose_path="${INSTALL_DIR}/${COMPOSE_FILE}"
-
-  if ! is_valid_version_tag "$target_ver"; then
-    err "Invalid version tag: ${target_ver}. Use 'latest' or X.Y.Z."
-    return 1
-  fi
-  if [[ ! -f "$compose_path" ]]; then
-    err "Compose file not found: ${compose_path}"
-    return 1
-  fi
-  if ! compose_file_is_telemt "$compose_path"; then
-    err "Compose file does not look like a telemt installer compose file: ${compose_path}"
-    return 1
-  fi
-
-  sed -i "s|^[[:space:]]*image:[[:space:]]*${DOCKER_IMAGE}:.*|    image: ${DOCKER_IMAGE}:${target_ver}|" \
-    "$compose_path"
+prune_old_local_images() {
+  local keep="$1"
+  local img
+  docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | grep -E "^${LOCAL_IMAGE}:" | grep -v ":${keep}\$" | while IFS= read -r img; do
+      docker rmi "$img" 2>/dev/null || true
+    done
 }
 
+# Switch version: writes .env, rebuilds, recreates; rolls back on failure.
 switch_running_version() {
-  local target_ver="$1"
-  local compose_path="${INSTALL_DIR}/${COMPOSE_FILE}"
-  local old_ver=""
+  local target_ver="$1" target_channel="$2"
 
   if ! is_valid_version_tag "$target_ver"; then
-    err "Invalid version tag: ${target_ver}. Use 'latest' or X.Y.Z."
+    err "Invalid version tag: ${target_ver}. Use X.Y.Z."
     return 1
   fi
-  if [[ ! -f "$compose_path" ]]; then
-    err "Compose file not found: ${compose_path}"
-    return 1
-  fi
-  if ! compose_file_is_telemt "$compose_path"; then
-    err "Compose file does not look like a telemt installer compose file: ${compose_path}"
+  if [[ ! -f "$ENV_PATH" ]]; then
+    err ".env not found: ${ENV_PATH}. Run install first."
     return 1
   fi
 
-  old_ver=$(get_current_version)
+  local old_ver old_channel
+  old_ver=$(get_current_version); old_ver=${old_ver:-unknown}
+  old_channel=$(get_update_channel)
 
-  if [[ -z "$old_ver" ]]; then
-    old_ver="unknown"
-  fi
+  local backup; backup=$(mktemp); cp "$ENV_PATH" "$backup"
 
-  local backup
-  backup=$(mktemp)
-  cp "$compose_path" "$backup"
+  set_env_kv "TELEMT_VERSION" "$target_ver" "$ENV_PATH"
+  set_env_kv "UPDATE_CHANNEL" "$target_channel" "$ENV_PATH"
 
-  if ! set_compose_version "$target_ver"; then
-    rm -f "$backup"
-    return 1
-  fi
-
-  cd "${INSTALL_DIR}" || {
-    rm -f "$backup"
-    err "Cannot cd to ${INSTALL_DIR}"
-    return 1
-  }
-
-  info "Pulling image …"
-  if ! docker compose pull; then
-    mv "$backup" "$compose_path"
-    err "Failed to pull ${DOCKER_IMAGE}:${target_ver}; compose restored to ${old_ver}."
-    return 1
-  fi
-
-  info "Restarting container …"
-  if ! docker compose up -d --force-recreate; then
-    mv "$backup" "$compose_path"
-    err "Failed to restart container; compose restored to ${old_ver}."
+  if ! rebuild_stack "--pull"; then
+    mv "$backup" "$ENV_PATH"
+    err "Rebuild failed; .env restored to ${old_ver} (${old_channel})."
+    rebuild_stack || true
     return 1
   fi
 
   rm -f "$backup"
-  echo "${target_ver}" > "${VERSION_FILE}"
+  prune_old_local_images "$target_ver"
   return 0
 }
 
 # ── detect existing installation ──────────────────────────────────────
-# Searches for install dirs, systemd units, containers (by name AND by
-# image), and docker images.  Sets:
-#   FOUND_DIRS        — array of install directories
-#   FOUND_CONTAINERS  — array of container IDs (by name + by image)
-#   FOUND_SYSTEMD     — array of systemd unit file paths
-#   FOUND_IMAGE       — bool (telemt image present)
 detect_existing_install() {
   FOUND_DIRS=()
   FOUND_CONTAINERS=()
   FOUND_SYSTEMD=()
   FOUND_IMAGE=false
 
-  # helper: deduplicate values in an array variable
   _add_dir() {
     local d="$1"
     [[ -z "$d" || ! -d "$d" ]] && return
@@ -340,7 +470,6 @@ detect_existing_install() {
     done
     FOUND_DIRS+=("$d")
   }
-
   _add_container() {
     local c="$1"
     [[ -z "$c" ]] && return
@@ -350,11 +479,8 @@ detect_existing_install() {
     FOUND_CONTAINERS+=("$c")
   }
 
-  # ── 1. Install directories ───────────────────────────────────────────
-  # 1a. Default path
   _add_dir "${INSTALL_DIR}"
 
-  # 1b. WorkingDirectory from systemd service files
   local svc_path
   for svc_path in \
     "/etc/systemd/system/${SERVICE_FILE}" \
@@ -367,32 +493,25 @@ detect_existing_install() {
     fi
   done
 
-  # ── 2. Systemd units (service + timer + updater) ─────────────────────
   local u
   for u in "${SERVICE_FILE}" "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service"; do
     [[ -f "/etc/systemd/system/$u" ]] && FOUND_SYSTEMD+=("$u")
   done
 
-  # ── 3. Containers — by name 'telemt' ─────────────────────────────────
   local cid
   cid=$(docker ps -a --filter 'name=^telemt$' --format '{{.ID}}' 2>/dev/null || true)
   [[ -n "$cid" ]] && _add_container "$cid"
 
-  # ── 4. Containers — by installer label ───────────────────────────────
   local labeled_cids
   labeled_cids=$(docker ps -a --filter 'label=org.civisrom.mt-docker=telemt' --format '{{.ID}}' 2>/dev/null || true)
   if [[ -n "$labeled_cids" ]]; then
-    while IFS= read -r cid; do
-      _add_container "$cid"
-    done <<< "$labeled_cids"
+    while IFS= read -r cid; do _add_container "$cid"; done <<< "$labeled_cids"
   fi
 
-  # ── 5. Docker image ──────────────────────────────────────────────────
-  if docker images --format '{{.Repository}}' 2>/dev/null | grep -qx 'whn0thacked/telemt-docker'; then
+  if docker images --format '{{.Repository}}' 2>/dev/null | grep -qx "${LOCAL_IMAGE}"; then
     FOUND_IMAGE=true
   fi
 
-  # Return 0 if anything was found
   if (( ${#FOUND_DIRS[@]} > 0 )) || \
      (( ${#FOUND_CONTAINERS[@]} > 0 )) || \
      (( ${#FOUND_SYSTEMD[@]} > 0 )) || \
@@ -403,18 +522,11 @@ detect_existing_install() {
 }
 
 # ── cleanup existing installation (targeted — telemt only) ────────────
-# Order of operations is critical:
-#   1. Stop systemd units FIRST  (prevents them from restarting containers)
-#   2. docker compose down        (only for trusted telemt compose files)
-#   3. Force-remove leftover installer containers
-#   4. Remove current telemt docker tag when it is unused
-#   6. Remove systemd unit files
-#   7. Remove trusted install directories
 cleanup_existing_install() {
   echo ""
   info "── Removing existing telemt MTProto installation ──"
 
-  # ── 1. Stop systemd units first (prevents restart races) ─────────────
+  # 1. Stop systemd units first (prevents restart races)
   if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
     info "Stopping systemd units …"
     local u
@@ -425,8 +537,7 @@ cleanup_existing_install() {
     done
   fi
 
-  # ── 2. docker compose down (graceful: stops containers, removes ──────
-  #        project networks and anonymous volumes)
+  # 2. docker compose down (graceful)
   local dir
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
     if ! is_safe_install_dir "$dir"; then
@@ -435,14 +546,15 @@ cleanup_existing_install() {
     fi
     if compose_file_is_telemt "${dir}/${COMPOSE_FILE}"; then
       info "Running compose down (${dir}/${COMPOSE_FILE}) …"
-      docker compose -f "${dir}/${COMPOSE_FILE}" down \
-        --remove-orphans --volumes 2>/dev/null || true
+      local envf=""
+      [[ -f "${dir}/${ENV_FILE}" ]] && envf="--env-file ${dir}/${ENV_FILE}"
+      # shellcheck disable=SC2086
+      docker compose -f "${dir}/${COMPOSE_FILE}" $envf down \
+        --remove-orphans --volumes --rmi local 2>/dev/null || true
     fi
   done
 
-  # ── 3. Force-remove any leftover containers (by ID) ─────────────────
-  #        Uses container IDs collected in detect_existing_install —
-  #        includes containers found by name AND by image.
+  # 3. Force-remove any leftover containers (by ID)
   if (( ${#FOUND_CONTAINERS[@]} > 0 )); then
     info "Force-removing telemt containers …"
     local cid cname
@@ -453,17 +565,32 @@ cleanup_existing_install() {
     done
   fi
 
-  # ── 4. Remove current telemt docker image tag if unused ──────────────
+  # 4. Remove all locally-built telemt images (by repository — scoped to ours)
   if $FOUND_IMAGE; then
-    local image_tag
-    image_tag=$(get_current_version)
-    if [[ -n "$image_tag" ]]; then
-      info "Removing telemt Docker image if unused: ${DOCKER_IMAGE}:${image_tag}"
-      docker rmi "${DOCKER_IMAGE}:${image_tag}" 2>/dev/null || true
+    info "Removing locally-built images: ${LOCAL_IMAGE} …"
+    local img
+    docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+      | grep -E "^${LOCAL_IMAGE}:" | while IFS= read -r img; do
+        docker rmi -f "$img" 2>/dev/null || true
+      done
+  fi
+
+  # 4b. Drop the dedicated buildx builder — removes THIS project's build cache
+  #     only. The default builder and other projects' caches are untouched.
+  #     This is the safe alternative to a global `docker builder prune`.
+  remove_builder
+
+  # 4c. As a fallback (build ran on the default builder, e.g. buildx absent),
+  #     reclaim only build-cache records that BuildKit itself marks as
+  #     belonging to the telemt image. We never run an unfiltered/global prune.
+  if command -v docker &>/dev/null && docker buildx version &>/dev/null; then
+    if docker buildx du --filter "description~=${LOCAL_IMAGE}" &>/dev/null; then
+      info "Pruning telemt build-cache records on the default builder …"
+      docker buildx prune -f --filter "description~=${LOCAL_IMAGE}" &>/dev/null || true
     fi
   fi
 
-  # ── 6. Remove systemd unit files from disk ──────────────────────────
+  # 6. Remove systemd unit files from disk
   if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
     info "Removing systemd unit files …"
     for u in "${FOUND_SYSTEMD[@]}"; do
@@ -473,7 +600,7 @@ cleanup_existing_install() {
     systemctl daemon-reload 2>/dev/null || true
   fi
 
-  # ── 7. Remove install directories ───────────────────────────────────
+  # 7. Remove install directories
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
     if [[ -d "$dir" ]]; then
       if ! is_safe_install_dir "$dir"; then
@@ -492,117 +619,16 @@ cleanup_existing_install() {
 # ── uninstall (--uninstall flag) ──────────────────────────────────────
 do_uninstall() {
   need_root
-
   if detect_existing_install; then
     cleanup_existing_install
   else
     warn "No existing telemt installation found."
   fi
-
   info "Uninstall complete."
   exit 0
 }
 
-# ── fetch available versions from Docker Hub ─────────────────────────
-# Returns list of semver tags (e.g., 3.3.27, 3.3.28, ...) sorted newest first
-fetch_available_versions() {
-  local api_url="${DOCKER_HUB_API}/?page_size=50&ordering=last_updated"
-  local raw_json=""
-
-  if command -v curl &>/dev/null; then
-    raw_json=$(curl -fsSL --connect-timeout 10 --max-time 20 "$api_url" 2>/dev/null || true)
-  elif command -v wget &>/dev/null; then
-    raw_json=$(wget -qO- --timeout=20 "$api_url" 2>/dev/null || true)
-  fi
-
-  if [[ -z "$raw_json" ]]; then
-    return 1
-  fi
-
-  # Extract semver tags (X.Y.Z), exclude pre-releases, cache, commit hashes
-  local tags=""
-  if command -v jq &>/dev/null; then
-    tags=$(echo "$raw_json" | jq -r '.results[].name' 2>/dev/null || true)
-  else
-    # Fallback: parse JSON without jq using portable grep/sed (no -P flag)
-    tags=$(echo "$raw_json" \
-      | sed 's/,/\n/g' \
-      | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)
-  fi
-
-  if [[ -z "$tags" ]]; then
-    return 1
-  fi
-
-  # Filter to semver-only and sort newest first
-  echo "$tags" \
-    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-    | sort -t. -k1,1rn -k2,2rn -k3,3rn \
-    || true
-}
-
-# Display version selection menu and set SELECTED_VERSION
-select_version() {
-  header "Version selection"
-
-  info "Fetching available versions from Docker Hub …"
-  local versions=""
-  versions=$(fetch_available_versions) || true
-
-  if [[ -z "$versions" ]]; then
-    warn "Could not fetch version list. Using 'latest'."
-    SELECTED_VERSION="latest"
-    return
-  fi
-
-  # Convert to array
-  local -a ver_array=()
-  while IFS= read -r v; do
-    ver_array+=("$v")
-  done <<< "$versions"
-
-  local total=${#ver_array[@]}
-  if (( total == 0 )); then
-    warn "No versions found. Using 'latest'."
-    SELECTED_VERSION="latest"
-    return
-  fi
-
-  echo ""
-  printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
-  printf "  %-4s  %-14s\n" "---" "-----------"
-  printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (always newest)\n" "0" "latest"
-
-  local i
-  for (( i=0; i<total && i<15; i++ )); do
-    if (( i == 0 )); then
-      printf "  ${CYAN}%-4s  %-14s${NC}  (newest release)\n" "$((i+1))" "${ver_array[$i]}"
-    else
-      printf "  %-4s  %-14s\n" "$((i+1))" "${ver_array[$i]}"
-    fi
-  done
-
-  if (( total > 15 )); then
-    info "  … and $((total - 15)) more (showing top 15)"
-  fi
-
-  echo ""
-  ask "Select version [0=latest]:"
-  read -r ver_choice
-  ver_choice=${ver_choice:-0}
-
-  if [[ "$ver_choice" == "0" ]]; then
-    SELECTED_VERSION="latest"
-  elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= total && ver_choice <= 15 )); then
-    SELECTED_VERSION="${ver_array[$((ver_choice - 1))]}"
-  else
-    warn "Invalid choice. Using 'latest'."
-    SELECTED_VERSION="latest"
-  fi
-
-  info "Selected version: ${SELECTED_VERSION}"
-}
-
+# ── auto-update unit files ───────────────────────────────────────────────
 write_auto_update_units() {
   if [[ ! -d "${INSTALL_DIR}" ]]; then
     err "Install directory not found: ${INSTALL_DIR}. Run install first."
@@ -612,11 +638,11 @@ write_auto_update_units() {
     err "Compose file not found: ${INSTALL_DIR}/${COMPOSE_FILE}. Run install first."
     return 1
   fi
-
   download_config_template "${UPDATER_TIMER}.service" "/etc/systemd/system/${UPDATER_TIMER}.service"
   download_config_template "${UPDATER_TIMER}.timer" "/etc/systemd/system/${UPDATER_TIMER}.timer"
-
   sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}|" \
+    "/etc/systemd/system/${UPDATER_TIMER}.service"
+  sed -i "s|^ExecStart=.*|ExecStart=${INSTALL_DIR}/install-mtproto.sh --auto-update|" \
     "/etc/systemd/system/${UPDATER_TIMER}.service"
 }
 
@@ -632,27 +658,66 @@ disable_auto_update_timer() {
   systemctl reset-failed "${UPDATER_TIMER}.timer" "${UPDATER_TIMER}.service" 2>/dev/null || true
 }
 
+# ── --auto-update (called by the update timer) ───────────────────────────
+do_auto_update() {
+  need_root
+  check_deps
+  if [[ ! -f "$ENV_PATH" ]]; then
+    err ".env not found: ${ENV_PATH}. Nothing to update."
+    exit 1
+  fi
+
+  local channel cur
+  channel=$(get_update_channel)
+  cur=$(get_current_version); cur=${cur:-unknown}
+
+  if [[ "$channel" != "latest" ]]; then
+    info "UPDATE_CHANNEL=${channel}; version pinned to ${cur}. Nothing to do."
+    exit 0
+  fi
+
+  info "Auto-update: resolving newest version from GHCR …"
+  local newest
+  newest=$(latest_version)
+  if [[ -z "$newest" ]]; then
+    warn "Could not resolve newest version; leaving ${cur} running."
+    exit 0
+  fi
+
+  if [[ "$newest" == "$cur" ]]; then
+    info "Already on newest version (${cur}). Nothing to do."
+    exit 0
+  fi
+
+  info "New version available: ${cur} → ${newest}. Rebuilding …"
+  if switch_running_version "$newest" "latest"; then
+    info "Updated to ${newest}."
+  else
+    err "Auto-update to ${newest} failed."
+    exit 1
+  fi
+  exit 0
+}
+
 # ── update management: enable/disable/status ─────────────────────────
 do_update_enable() {
   need_root
-
-  # Warn if version is pinned (auto-update would be a no-op)
-  if [[ -f "${VERSION_FILE}" ]]; then
-    local pinned
-    pinned=$(cat "${VERSION_FILE}" 2>/dev/null || true)
-    if [[ -n "$pinned" && "$pinned" != "latest" ]]; then
-      warn "Version is pinned to '${pinned}'."
-      warn "Auto-update will only re-pull this same version (no-op)."
-      ask "Switch to 'latest' to receive new versions? [Y/n]:"
-      read -r switch_latest
-      switch_latest=${switch_latest:-Y}
-      if [[ "${switch_latest,,}" =~ ^y ]]; then
-        switch_running_version "latest" || exit 1
-        info "Switched to 'latest'."
-      fi
+  local channel
+  channel=$(get_update_channel)
+  if [[ "$channel" != "latest" ]]; then
+    local pinned; pinned=$(get_current_version)
+    warn "Version is pinned to '${pinned}' (channel: ${channel})."
+    warn "Auto-update only acts on channel 'latest'."
+    ask "Switch to 'latest' (track newest) and rebuild? [Y/n]:"
+    read -r switch_latest
+    switch_latest=${switch_latest:-Y}
+    if [[ "${switch_latest,,}" =~ ^y ]]; then
+      local newest; newest=$(latest_version)
+      newest=${newest:-$pinned}
+      switch_running_version "$newest" "latest" || exit 1
+      info "Switched to 'latest' (${newest})."
     fi
   fi
-
   enable_auto_update_timer || exit 1
   info "Auto-update ENABLED."
   info "Next run: $(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | tail -2 | head -1 || echo 'check systemctl list-timers')"
@@ -674,33 +739,61 @@ do_update_disable() {
 do_update_status() {
   echo ""
   header "Update status"
-
-  # Current image version
   local cur_img
   cur_img=$(docker inspect --format '{{.Config.Image}}' telemt 2>/dev/null || echo "unknown")
-  info "Current image  : ${cur_img}"
+  info "Running image  : ${cur_img}"
+  info "Source image   : ${GHCR_IMAGE}:$(get_current_version 2>/dev/null || echo '?')"
+  info "Pinned version : $(get_current_version 2>/dev/null || echo 'not set')"
+  info "Update channel : $(get_update_channel)"
 
-  # Pinned version from file
-  if [[ -f "${VERSION_FILE}" ]]; then
-    info "Pinned version : $(cat "${VERSION_FILE}")"
-  else
-    info "Pinned version : not set (using compose default)"
-  fi
-
-  # Timer status
   if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
     printf '%b[INFO]%b  Auto-update   : %bENABLED%b\n' "$GREEN" "$NC" "$GREEN" "$NC"
     local next
     next=$(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | grep "${UPDATER_TIMER}" || echo "")
-    if [[ -n "$next" ]]; then
-      info "Timer info     : ${next}"
-    fi
+    [[ -n "$next" ]] && info "Timer info     : ${next}"
   elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
     printf '%b[INFO]%b  Auto-update   : %bDISABLED%b\n' "$YELLOW" "$NC" "$YELLOW" "$NC"
   else
     info "Auto-update    : not installed"
   fi
+  echo ""
+  exit 0
+}
 
+# ── lifecycle subcommands (start/stop/restart/status/logs management) ─────
+require_install() {
+  if [[ ! -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
+    err "No installation found at ${INSTALL_DIR}. Run the installer first."
+    exit 1
+  fi
+}
+
+do_rebuild() {
+  need_root; check_deps; require_install
+  header "Rebuild & recreate"
+  rebuild_stack "--pull" || { err "Rebuild failed."; exit 1; }
+  prune_old_local_images "$(get_current_version)"
+  info "Rebuilt and recreated (version $(get_current_version))."
+  exit 0
+}
+
+do_start()   { need_root; require_install; compose_build || { err "Build failed."; exit 1; }; compose up -d; info "Started."; exit 0; }
+do_stop()    { need_root; require_install; compose down; info "Stopped."; exit 0; }
+do_ensure_builder() { need_root; ensure_builder && info "Builder '${BUILDER_NAME}' ready." || warn "Dedicated builder unavailable; default builder will be used."; exit 0; }
+do_restart() { need_root; require_install; compose up -d --force-recreate; info "Restarted."; exit 0; }
+do_logs()    { require_install; docker logs telemt --tail=100 -f; exit 0; }
+
+do_status() {
+  require_install
+  header "telemt status"
+  docker ps -a --filter 'name=^telemt$' \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null || true
+  echo ""
+  info "Version       : $(get_current_version 2>/dev/null || echo '?')"
+  info "Update channel: $(get_update_channel)"
+  if systemctl is-enabled "${SERVICE_FILE}" &>/dev/null; then
+    info "Service       : ${SERVICE_NAME} ($(systemctl is-active "${SERVICE_FILE}" 2>/dev/null || echo inactive))"
+  fi
   echo ""
   exit 0
 }
@@ -708,60 +801,59 @@ do_update_status() {
 # Set specific version in running installation
 do_set_version() {
   need_root
+  require_install
   local target_ver="${2:-}"
+  local target_channel="pinned"
 
   if [[ -z "$target_ver" ]]; then
-    # Interactive mode: show available versions
-    info "Fetching available versions …"
+    info "Fetching available versions from GHCR …"
     local versions=""
     versions=$(fetch_available_versions) || true
-
     if [[ -z "$versions" ]]; then
       err "Could not fetch version list."
       exit 1
     fi
-
     local -a ver_array=()
-    while IFS= read -r v; do
-      ver_array+=("$v")
-    done <<< "$versions"
+    while IFS= read -r v; do ver_array+=("$v"); done <<< "$versions"
+    local newest="${ver_array[0]}"
 
     echo ""
     printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
     printf "  %-4s  %-14s\n" "---" "-----------"
-    printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (always newest)\n" "0" "latest"
-
+    printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (track newest)\n" "0" "latest"
     local i total=${#ver_array[@]}
     for (( i=0; i<total && i<15; i++ )); do
       printf "  %-4s  %-14s\n" "$((i+1))" "${ver_array[$i]}"
     done
     echo ""
-
     ask "Select version [0=latest]:"
     read -r ver_choice
     ver_choice=${ver_choice:-0}
 
     if [[ "$ver_choice" == "0" ]]; then
-      target_ver="latest"
+      target_ver="${newest}"; target_channel="latest"
     elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= total && ver_choice <= 15 )); then
-      target_ver="${ver_array[$((ver_choice - 1))]}"
+      target_ver="${ver_array[$((ver_choice - 1))]}"; target_channel="pinned"
     else
       err "Invalid choice."
       exit 1
     fi
+  else
+    if [[ "$target_ver" == "latest" ]]; then
+      target_ver=$(latest_version)
+      [[ -z "$target_ver" ]] && { err "Could not resolve 'latest'."; exit 1; }
+      target_channel="latest"
+    fi
   fi
 
-  info "Switching to version: ${target_ver}"
+  info "Switching to version: ${target_ver} (channel: ${target_channel})"
+  switch_running_version "$target_ver" "$target_channel" || exit 1
 
-  switch_running_version "$target_ver" || exit 1
-
-  # If pinned to specific version, offer to disable auto-update (it would be a no-op anyway)
-  if [[ "$target_ver" != "latest" ]]; then
+  if [[ "$target_channel" == "pinned" ]]; then
     if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
       echo ""
-      warn "Auto-update is currently ENABLED."
-      warn "With a pinned version, auto-update will only re-pull ${target_ver} (no-op)."
-      warn "To receive new versions, switch to 'latest' or disable the timer."
+      warn "Auto-update is ENABLED but the version is now pinned (${target_ver})."
+      warn "The timer will not change a pinned version."
       ask "Disable auto-update? [Y/n]:"
       read -r disable_update
       disable_update=${disable_update:-Y}
@@ -771,30 +863,39 @@ do_set_version() {
       fi
     fi
   fi
-
   info "Done. Running version: ${target_ver}"
   exit 0
 }
 
 # ── CLI subcommands ───────────────────────────────────────────────────
-if [[ "${1:-}" == "--uninstall" ]]; then do_uninstall; fi
-if [[ "${1:-}" == "--update-enable" ]]; then do_update_enable; fi
-if [[ "${1:-}" == "--update-disable" ]]; then do_update_disable; fi
-if [[ "${1:-}" == "--update-status" ]]; then do_update_status; fi
-if [[ "${1:-}" == "--set-version" ]]; then do_set_version "$@"; fi
-if [[ "${1:-}" == "--list-versions" ]]; then
-  info "Fetching available versions from Docker Hub …"
-  versions=$(fetch_available_versions) || true
-  if [[ -z "$versions" ]]; then
-    err "Could not fetch version list."
-    exit 1
-  fi
-  echo ""
-  printf '  %bAvailable versions:%b\n' "$BOLD" "$NC"
-  echo "$versions" | head -20
-  echo ""
-  exit 0
-fi
+case "${1:-}" in
+  --uninstall)        do_uninstall ;;
+  --rebuild)          do_rebuild ;;
+  --start)            do_start ;;
+  --stop)             do_stop ;;
+  --restart)          do_restart ;;
+  --ensure-builder)   do_ensure_builder ;;
+  --status)           do_status ;;
+  --logs)             do_logs ;;
+  --auto-update)      do_auto_update ;;
+  --update-enable)    do_update_enable ;;
+  --update-disable)   do_update_disable ;;
+  --update-status)    do_update_status ;;
+  --set-version)      do_set_version "$@" ;;
+  --list-versions)
+    info "Fetching available versions from GHCR (ghcr.io/telemt/telemt) …"
+    versions=$(fetch_available_versions) || true
+    if [[ -z "$versions" ]]; then
+      err "Could not fetch version list."
+      exit 1
+    fi
+    echo ""
+    printf '  %bAvailable versions:%b\n' "$BOLD" "$NC"
+    echo "$versions" | head -20
+    echo ""
+    exit 0
+    ;;
+esac
 
 # ══════════════════════════════════════════════════════════════════════════
 # ██  INTERACTIVE CONFIGURATION                                          ██
@@ -803,24 +904,19 @@ need_root
 check_deps
 
 echo ""
-info "=== MTProto Proxy (telemt) — Host Mode Installer ==="
+info "=== MTProto Proxy (telemt) — Host Mode Installer (build-based) ==="
 echo ""
 
-# ── detect & offer to remove previous installation ───────────────────
+# ── detect & offer to manage previous installation ────────────────────
 if detect_existing_install; then
   header "Existing telemt installation detected"
 
-  # show what was found
   for dir in "${FOUND_DIRS[@]+"${FOUND_DIRS[@]}"}"; do
     info "  Install directory : ${dir}"
     if [[ -f "${dir}/${CONFIG_DIR}/${CONFIG_FILE}" ]]; then
       info "    config          : ${dir}/${CONFIG_DIR}/${CONFIG_FILE}"
-    elif [[ -f "${dir}/${CONFIG_FILE}" ]]; then
-      info "    config (legacy) : ${dir}/${CONFIG_FILE}"
     fi
-    if [[ -f "${dir}/${COMPOSE_FILE}" ]]; then
-      info "    compose         : ${dir}/${COMPOSE_FILE}"
-    fi
+    [[ -f "${dir}/${COMPOSE_FILE}" ]] && info "    compose         : ${dir}/${COMPOSE_FILE}"
   done
 
   if (( ${#FOUND_CONTAINERS[@]} > 0 )); then
@@ -833,7 +929,7 @@ if detect_existing_install; then
 
   if $FOUND_IMAGE; then
     itag=$(docker images --format '{{.Repository}}:{{.Tag}}  ({{.Size}})' \
-      --filter 'reference=whn0thacked/telemt-docker' 2>/dev/null | head -1 || echo "present")
+      --filter "reference=${LOCAL_IMAGE}" 2>/dev/null | head -1 || echo "present")
     info "  Image             : ${itag}"
   fi
 
@@ -844,15 +940,10 @@ if detect_existing_install; then
     done
   fi
 
-  # Show current version & auto-update status
   echo ""
-  cur_ver="unknown"
-  if [[ -f "${VERSION_FILE}" ]]; then
-    cur_ver=$(cat "${VERSION_FILE}" 2>/dev/null || echo "unknown")
-  elif [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
-    cur_ver=$(sed -n "s/.*image:[[:space:]]*${DOCKER_IMAGE}:\(.*\)/\1/p" "${INSTALL_DIR}/${COMPOSE_FILE}" 2>/dev/null || echo "unknown")
-  fi
-  info "  Current version   : ${DOCKER_IMAGE}:${cur_ver}"
+  cur_ver=$(get_current_version 2>/dev/null || echo "unknown")
+  cur_ver=${cur_ver:-unknown}
+  info "  Current version   : ${LOCAL_IMAGE}:${cur_ver} (channel: $(get_update_channel))"
 
   update_state="not installed"
   if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
@@ -864,113 +955,75 @@ if detect_existing_install; then
 
   echo ""
   printf '%bChoose an option:%b\n' "$BOLD" "$NC"
-  echo "  1) Change version (show available & switch)"
+  echo "  1) Change version (show available & rebuild)"
   echo "  2) Toggle auto-update (enable / disable)"
-  echo "  3) Remove existing installation and install fresh"
-  echo "  4) Exit"
+  echo "  3) Rebuild current version (refresh base image)"
+  echo "  4) Reinstall (remove and install fresh)"
+  echo "  5) Uninstall completely (remove container, image, build cache, files)"
+  echo "  6) Exit"
   echo ""
-  ask "Your choice [1-4]:"
+  ask "Your choice [1-6]:"
   read -r mgmt_choice
 
   case "${mgmt_choice}" in
     1)
-      # ── Interactive version switch ──────────────────────────────
       header "Change version"
       info "Current version: ${cur_ver}"
-      echo ""
-
-      info "Fetching available versions from Docker Hub …"
-      mgmt_versions=""
+      info "Fetching available versions from GHCR …"
       mgmt_versions=$(fetch_available_versions) || true
-
       if [[ -z "$mgmt_versions" ]]; then
         err "Could not fetch version list."
         exit 1
       fi
-
       mgmt_ver_array=()
-      while IFS= read -r v; do
-        mgmt_ver_array+=("$v")
-      done <<< "$mgmt_versions"
-
+      while IFS= read -r v; do mgmt_ver_array+=("$v"); done <<< "$mgmt_versions"
       mgmt_total=${#mgmt_ver_array[@]}
+      mgmt_newest="${mgmt_ver_array[0]}"
       echo ""
       printf "  ${BOLD}%-4s  %-14s${NC}\n" "#" "Version"
       printf "  %-4s  %-14s\n" "---" "-----------"
-      printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (always newest)\n" "0" "latest"
-
-      mgmt_i=0
+      printf "  ${GREEN}${BOLD}%-4s  %-14s${NC}  (track newest)\n" "0" "latest"
       for (( mgmt_i=0; mgmt_i<mgmt_total && mgmt_i<15; mgmt_i++ )); do
         marker=""
-        if [[ "${mgmt_ver_array[$mgmt_i]}" == "$cur_ver" ]]; then
-          marker="  <-- current"
-        fi
-        if (( mgmt_i == 0 )); then
-          printf "  ${CYAN}%-4s  %-14s${NC}  (newest release)%s\n" "$((mgmt_i+1))" "${mgmt_ver_array[$mgmt_i]}" "$marker"
-        else
-          printf "  %-4s  %-14s%s\n" "$((mgmt_i+1))" "${mgmt_ver_array[$mgmt_i]}" "$marker"
-        fi
+        [[ "${mgmt_ver_array[$mgmt_i]}" == "$cur_ver" ]] && marker="  <-- current"
+        printf "  %-4s  %-14s%s\n" "$((mgmt_i+1))" "${mgmt_ver_array[$mgmt_i]}" "$marker"
       done
-
-      if (( mgmt_total > 15 )); then
-        info "  … and $((mgmt_total - 15)) more (showing top 15)"
-      fi
-
+      (( mgmt_total > 15 )) && info "  … and $((mgmt_total - 15)) more (showing top 15)"
       echo ""
       ask "Select version [0=latest]:"
       read -r ver_choice
       ver_choice=${ver_choice:-0}
 
-      target_ver=""
       if [[ "$ver_choice" == "0" ]]; then
-        target_ver="latest"
+        target_ver="${mgmt_newest}"; target_channel="latest"
       elif [[ "$ver_choice" =~ ^[0-9]+$ ]] && (( ver_choice >= 1 && ver_choice <= mgmt_total && ver_choice <= 15 )); then
-        target_ver="${mgmt_ver_array[$((ver_choice - 1))]}"
+        target_ver="${mgmt_ver_array[$((ver_choice - 1))]}"; target_channel="pinned"
       else
-        err "Invalid choice."
-        exit 1
+        err "Invalid choice."; exit 1
       fi
 
-      if [[ "$target_ver" == "$cur_ver" ]]; then
-        info "Already running version ${cur_ver}. No changes needed."
-        exit 0
-      fi
+      info "Switching: ${cur_ver} → ${target_ver} (channel: ${target_channel})"
+      switch_running_version "$target_ver" "$target_channel" || exit 1
 
-      info "Switching: ${cur_ver} → ${target_ver}"
-
-      switch_running_version "$target_ver" || exit 1
-
-      # Smart auto-update handling
-      if [[ "$target_ver" != "latest" ]]; then
-        if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
-          echo ""
-          warn "Auto-update is ENABLED but version is now pinned to ${target_ver}."
-          warn "The timer will only re-pull this same tag (no-op)."
-          ask "Disable auto-update? [Y/n]:"
-          read -r disable_upd
-          disable_upd=${disable_upd:-Y}
-          if [[ "${disable_upd,,}" =~ ^y ]]; then
-            disable_auto_update_timer
-            info "Auto-update disabled."
-          fi
+      if [[ "$target_channel" == "pinned" ]] && systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
+        echo ""
+        warn "Auto-update is ENABLED but version is now pinned to ${target_ver}."
+        ask "Disable auto-update? [Y/n]:"
+        read -r disable_upd
+        disable_upd=${disable_upd:-Y}
+        if [[ "${disable_upd,,}" =~ ^y ]]; then
+          disable_auto_update_timer
+          info "Auto-update disabled."
         fi
       fi
-
       echo ""
       info "Done. Running version: ${target_ver}"
       exit 0
       ;;
-
     2)
-      # ── Toggle auto-update ──────────────────────────────────────
       header "Auto-update management"
-
       if systemctl is-active "${UPDATER_TIMER}.timer" &>/dev/null; then
         printf '  Auto-update is currently: %b%bENABLED%b\n' "$GREEN" "$BOLD" "$NC"
-        next_run=$(systemctl list-timers "${UPDATER_TIMER}.timer" --no-pager 2>/dev/null | grep "${UPDATER_TIMER}" || echo "")
-        if [[ -n "$next_run" ]]; then
-          info "  ${next_run}"
-        fi
         echo ""
         ask "Disable auto-update? [Y/n]:"
         read -r toggle_choice
@@ -981,57 +1034,53 @@ if detect_existing_install; then
         else
           info "No changes."
         fi
-      elif [[ -f "/etc/systemd/system/${UPDATER_TIMER}.timer" ]]; then
+      else
         printf '  Auto-update is currently: %b%bDISABLED%b\n' "$YELLOW" "$BOLD" "$NC"
         echo ""
-
-        # Warn if version is pinned
-        if [[ -f "${VERSION_FILE}" ]]; then
-          pinned=$(cat "${VERSION_FILE}" 2>/dev/null || true)
-          if [[ -n "$pinned" && "$pinned" != "latest" ]]; then
-            warn "Version is pinned to '${pinned}'."
-            warn "Auto-update will only re-pull this same tag."
-            ask "Switch to 'latest' and enable auto-update? [Y/n]:"
-            read -r switch_and_enable
-            switch_and_enable=${switch_and_enable:-Y}
-            if [[ "${switch_and_enable,,}" =~ ^y ]]; then
-              switch_running_version "latest" || exit 1
-              info "Switched to 'latest'."
-            fi
+        if [[ "$(get_update_channel)" != "latest" ]]; then
+          warn "Version is pinned (${cur_ver}); auto-update only acts on channel 'latest'."
+          ask "Switch to 'latest' (track newest) and enable auto-update? [Y/n]:"
+          read -r switch_and_enable
+          switch_and_enable=${switch_and_enable:-Y}
+          if [[ "${switch_and_enable,,}" =~ ^y ]]; then
+            newest=$(latest_version); newest=${newest:-$cur_ver}
+            switch_running_version "$newest" "latest" || exit 1
+            info "Switched to 'latest' (${newest})."
           fi
         fi
-
         ask "Enable auto-update? [Y/n]:"
         read -r toggle_choice
         toggle_choice=${toggle_choice:-Y}
         if [[ "${toggle_choice,,}" =~ ^y ]]; then
           enable_auto_update_timer || exit 1
-          info "Auto-update ENABLED."
+          info "Auto-update ENABLED (daily at ~04:00)."
         else
           info "No changes."
-        fi
-      else
-        warn "Auto-update timer is not installed."
-        ask "Create and enable auto-update timer? [Y/n]:"
-        read -r create_timer
-        create_timer=${create_timer:-Y}
-        if [[ "${create_timer,,}" =~ ^y ]]; then
-          enable_auto_update_timer || exit 1
-          info "Auto-update timer created and ENABLED (daily at ~04:00)."
         fi
       fi
       exit 0
       ;;
-
     3)
+      header "Rebuild current version"
+      rebuild_stack "--pull" || { err "Rebuild failed."; exit 1; }
+      prune_old_local_images "$(get_current_version)"
+      info "Rebuilt version ${cur_ver}."
+      exit 0
+      ;;
+    4)
+      # Reinstall: clean up, then fall through to the fresh-install flow below.
       cleanup_existing_install
       ;;
-
-    4)
+    5)
+      # Full uninstall: clean up everything and stop.
+      cleanup_existing_install
+      info "Uninstall complete."
+      exit 0
+      ;;
+    6)
       info "Exiting."
       exit 0
       ;;
-
     *)
       err "Invalid choice. Exiting."
       exit 1
@@ -1050,14 +1099,13 @@ declare -A SECRETS=()
 while true; do
   ask "Enter username (or empty to finish):"
   read -r uname
-  uname="${uname#"${uname%%[![:space:]]*}"}" # trim leading
-  uname="${uname%"${uname##*[![:space:]]}"}" # trim trailing
+  uname="${uname#"${uname%%[![:space:]]*}"}"
+  uname="${uname%"${uname##*[![:space:]]}"}"
   if [[ -z "$uname" ]]; then break; fi
   if [[ ! "$uname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     warn "Username may only contain letters, digits, '_' and '-'. Try again."
     continue
   fi
-  # reject duplicate usernames
   if [[ -n "${SECRETS[$uname]+_}" ]]; then
     warn "User '${uname}' already added. Try a different name."
     continue
@@ -1076,14 +1124,11 @@ while true; do
     while true; do
       ask "Enter 32-char hex secret:"
       read -r secret
-      # trim whitespace
       secret="${secret#"${secret%%[![:space:]]*}"}"
       secret="${secret%"${secret##*[![:space:]]}"}"
-      # lowercase
       secret="${secret,,}"
       if [[ ! "$secret" =~ ^[0-9a-f]{32}$ ]]; then
         warn "Invalid secret: must be exactly 32 hexadecimal characters (0-9, a-f)."
-        warn "Got ${#secret} chars: '${secret}'"
         continue
       fi
       break
@@ -1111,7 +1156,6 @@ info "Container runs in host network mode — the port you set here"
 info "is the actual port on the host. Make sure it's not in use."
 echo ""
 
-# --- server port ---
 while true; do
   ask "Telemt listen port [443]:"
   read -r PORT
@@ -1120,7 +1164,6 @@ while true; do
     warn "Invalid port: ${PORT} (must be 1–65535). Try again."
     continue
   fi
-  # Check if port is already in use (best-effort)
   if command -v ss &>/dev/null; then
     if ss -tlnp 2>/dev/null | grep -qE "[[:space:]][^[:space:]]*:${PORT}[[:space:]]"; then
       warn "Port ${PORT} appears to be already in use on this host."
@@ -1134,10 +1177,8 @@ while true; do
   break
 done
 
-# --- announce IP ---
 echo ""
 info "announce_ip — the public IP that telemt advertises in proxy links."
-info "Clients (Telegram relay servers) connect to this IP."
 echo ""
 
 DETECTED_IP=""
@@ -1157,18 +1198,14 @@ while true; do
     ask "Announce IP (external IP of this server):"
     read -r ANNOUNCE_IP
   fi
-
   if [[ -z "$ANNOUNCE_IP" ]]; then
-    warn "announce_ip is required."
-    continue
+    warn "announce_ip is required."; continue
   fi
   if ! sanitize_input "$ANNOUNCE_IP"; then
-    warn "Invalid characters in IP address."
-    continue
+    warn "Invalid characters in IP address."; continue
   fi
   if ! is_valid_ipv4 "$ANNOUNCE_IP"; then
-    warn "Invalid IPv4 address: ${ANNOUNCE_IP}. Try again."
-    continue
+    warn "Invalid IPv4 address: ${ANNOUNCE_IP}. Try again."; continue
   fi
   break
 done
@@ -1179,28 +1216,22 @@ done
 header "TLS masking (censorship bypass)"
 
 info "Telemt disguises MTProto traffic as TLS to a legitimate website."
-info "Choose a popular HTTPS site that is NOT blocked in your region."
 info "Examples: www.google.com, www.microsoft.com, cloudflare.com"
 echo ""
 
-# --- TLS domain ---
 while true; do
   ask "TLS domain [www.google.com]:"
   read -r TLS_DOMAIN
   TLS_DOMAIN=${TLS_DOMAIN:-www.google.com}
-
   if ! sanitize_input "$TLS_DOMAIN"; then
-    warn "Invalid characters in domain."
-    continue
+    warn "Invalid characters in domain."; continue
   fi
   if ! is_valid_domain "$TLS_DOMAIN"; then
-    warn "Invalid domain format: ${TLS_DOMAIN}. Try again."
-    continue
+    warn "Invalid domain format: ${TLS_DOMAIN}. Try again."; continue
   fi
   break
 done
 
-# mask_port — HTTPS port on the masking domain, always 443
 MASK_PORT=443
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1217,15 +1248,13 @@ ask "Create systemd service for auto-start? [Y/n]:"
 read -r CREATE_SERVICE
 CREATE_SERVICE=${CREATE_SERVICE:-Y}
 
-# If pinned to a specific version, default auto-update to No
-if [[ "${SELECTED_VERSION}" != "latest" ]]; then
-  warn "You selected a pinned version (${SELECTED_VERSION})."
-  warn "Auto-update would override this — defaulting to disabled."
-  ask "Enable automatic daily image update? [y/N]:"
+if [[ "${SELECTED_CHANNEL}" != "latest" ]]; then
+  warn "You pinned version ${SELECTED_VERSION}; auto-update acts only on channel 'latest'."
+  ask "Enable automatic daily rebuild/update? [y/N]:"
   read -r AUTO_UPDATE
   AUTO_UPDATE=${AUTO_UPDATE:-N}
 else
-  ask "Enable automatic daily image update? [Y/n]:"
+  ask "Enable automatic daily rebuild/update? [Y/n]:"
   read -r AUTO_UPDATE
   AUTO_UPDATE=${AUTO_UPDATE:-Y}
 fi
@@ -1233,101 +1262,85 @@ fi
 # ══════════════════════════════════════════════════════════════════════════
 # ██  DEPLOYMENT                                                          ██
 # ══════════════════════════════════════════════════════════════════════════
-
 header "Deploying"
 
-# ── prepare install directory ───────────────────────────────────────────
 info "Creating ${INSTALL_DIR} …"
 mkdir -p "${INSTALL_DIR}"
 
-# Create config subdirectory (mounted as volume for atomic config writes)
-info "Creating ${INSTALL_DIR}/${CONFIG_DIR} …"
-mkdir -p "${INSTALL_DIR}/${CONFIG_DIR}"
+info "Creating ${INSTALL_DIR}/${CONFIG_DIR} (config + data) …"
+mkdir -p "${INSTALL_DIR}/${CONFIG_DIR}/data"
 
 cat > "${INSTALL_DIR}/${INSTALL_MARKER}" <<MARKER
 name=telemt
 script=mt-docker
 compose=${COMPOSE_FILE}
+dockerfile=${DOCKERFILE}
 config_dir=${CONFIG_DIR}
-image=${DOCKER_IMAGE}
+source_image=${GHCR_IMAGE}
+local_image=${LOCAL_IMAGE}
 MARKER
 
 info "Installing management script copy …"
 install_self_copy
 
-# ── download templates from repo config/ ───────────────────────────────
+info "Downloading template: ${DOCKERFILE} …"
+download_config_template "${DOCKERFILE}" "${INSTALL_DIR}/${DOCKERFILE}"
+
 info "Downloading template: ${CONFIG_FILE} …"
 download_config_template "${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 
 info "Downloading template: ${COMPOSE_FILE} …"
 download_config_template "${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}"
 
-# Set permissions so the distroless non-root user can modify the config
-# for atomic writes (.tmp + rename) without making it world-writable.
+# ── write .env (build arg + update channel) ──────────────────────────────
+info "Writing ${ENV_FILE} (TELEMT_VERSION=${SELECTED_VERSION}, UPDATE_CHANNEL=${SELECTED_CHANNEL}) …"
+set_env_kv "TELEMT_VERSION" "${SELECTED_VERSION}" "${ENV_PATH}"
+set_env_kv "UPDATE_CHANNEL" "${SELECTED_CHANNEL}" "${ENV_PATH}"
+
+# Config + data must be writable by the non-root container user (uid 65532)
 chown -R "${NONROOT_UID}:${NONROOT_GID}" "${INSTALL_DIR}/${CONFIG_DIR}"
-chmod 755 "${INSTALL_DIR}/${CONFIG_DIR}"
+chmod 755 "${INSTALL_DIR}/${CONFIG_DIR}" "${INSTALL_DIR}/${CONFIG_DIR}/data"
 chmod 644 "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
-
-# ── pin selected version in docker-compose.yml ───────────────────────
-info "Pinning image version: ${DOCKER_IMAGE}:${SELECTED_VERSION}"
-sed -i "s|image: ${DOCKER_IMAGE}:.*|image: ${DOCKER_IMAGE}:${SELECTED_VERSION}|" \
-  "${INSTALL_DIR}/${COMPOSE_FILE}"
-
-# Save version info for management commands
-echo "${SELECTED_VERSION}" > "${VERSION_FILE}"
 
 # ── patch telemt.toml ──────────────────────────────────────────────────
 info "Configuring ${CONFIG_FILE} …"
 
-# build show_link value: ["user1", "user2", ...]
 show_link_val=""
 for u in "${USERS[@]}"; do
   show_link_val+="\"${u}\", "
 done
 show_link_val="[${show_link_val%, }]"
 
-# build [access.users] block into a temp file (avoids sed quoting issues)
 users_tmp=$(mktemp)
 trap 'rm -f "$users_tmp"' EXIT
 for u in "${USERS[@]}"; do
   echo "${u} = \"${SECRETS[$u]}\"" >> "$users_tmp"
 done
 
-# full path to the config file inside the subdirectory
 CONFIG_PATH="${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 
-# apply values with sed
-sed -i "s|^show_link = .*|show_link = ${show_link_val}|"              "${CONFIG_PATH}"
-sed -i "s|^port = .*|port = ${PORT}|"                                 "${CONFIG_PATH}"
-sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|"         "${CONFIG_PATH}"
-sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"           "${CONFIG_PATH}"
-sed -i "s|^mask_port = .*|mask_port = ${MASK_PORT}|"                   "${CONFIG_PATH}"
+sed -i "s|^show_link = .*|show_link = ${show_link_val}|"        "${CONFIG_PATH}"
+sed -i "s|^port = .*|port = ${PORT}|"                           "${CONFIG_PATH}"
+sed -i "s|^announce_ip = .*|announce_ip = \"${ANNOUNCE_IP}\"|"   "${CONFIG_PATH}"
+sed -i "s|^tls_domain = .*|tls_domain = \"${TLS_DOMAIN}\"|"     "${CONFIG_PATH}"
+sed -i "s|^mask_port = .*|mask_port = ${MASK_PORT}|"            "${CONFIG_PATH}"
 
-# insert user lines after [access.users] using 'r' (read file) command
 sed -i "/^\[access\.users\]$/r ${users_tmp}" "${CONFIG_PATH}"
 rm -f "$users_tmp"
 trap - EXIT
 
-# ── non-root port handling ─────────────────────────────────────────────
-# The upstream image is non-root by default. Keep the container non-root
-# and rely on NET_BIND_SERVICE for privileged ports where the host kernel
-# requires it.
 if (( PORT < 1024 )); then
-  info "Port ${PORT} is privileged (<1024); keeping non-root container with NET_BIND_SERVICE."
+  info "Port ${PORT} is privileged (<1024); the built binary carries cap_net_bind_service."
 fi
-
-# ── Note: docker-compose.yml uses network_mode: host ─────────────────
-# Port exposure is controlled by telemt.toml [server] port setting,
-# not by Docker port mapping. No compose patching needed.
 
 # ── systemd service ────────────────────────────────────────────────────
 if [[ "${CREATE_SERVICE,,}" =~ ^y ]]; then
   info "Downloading template: ${SERVICE_FILE} …"
   download_config_template "${SERVICE_FILE}" "/etc/systemd/system/${SERVICE_FILE}"
-
-  # patch WorkingDirectory in case INSTALL_DIR differs from default
   sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}|" "/etc/systemd/system/${SERVICE_FILE}"
-
+  # Point Exec* lines at the installed script copy (handles non-default INSTALL_DIR)
+  sed -i "s|/opt/telemt/install-mtproto.sh|${INSTALL_DIR}/install-mtproto.sh|g" \
+    "/etc/systemd/system/${SERVICE_FILE}"
   systemctl daemon-reload
   systemctl enable "${SERVICE_FILE}"
   info "Service enabled: ${SERVICE_FILE}"
@@ -1340,18 +1353,17 @@ if [[ "${AUTO_UPDATE,,}" =~ ^y ]]; then
   info "Auto-update timer enabled (daily at ~04:00)."
 fi
 
-# ── pull image & start ─────────────────────────────────────────────────
-info "Pulling Docker image …"
-
+# ── build image & start ────────────────────────────────────────────────
+info "Building image ${LOCAL_IMAGE}:${SELECTED_VERSION} from ${GHCR_IMAGE}:${SELECTED_VERSION} …"
 cd "${INSTALL_DIR}" || { err "Cannot cd to ${INSTALL_DIR}"; exit 1; }
 
-if ! docker compose pull; then
-  err "Failed to pull Docker image. Check your internet connection."
+if ! compose_build --pull; then
+  err "Failed to build the image. Check Docker and network connectivity."
   exit 1
 fi
 
 info "Starting container …"
-if ! docker compose up -d; then
+if ! compose up -d; then
   err "Failed to start container. Check config with: docker compose config"
   exit 1
 fi
@@ -1384,7 +1396,6 @@ if command -v ss &>/dev/null; then
     fi
     sleep 2
   done
-
   if $port_listening; then
     info "Port ${PORT} is listening — OK"
   else
@@ -1407,7 +1418,9 @@ info "Install dir  : ${INSTALL_DIR}"
 info "Config dir   : ${INSTALL_DIR}/${CONFIG_DIR}"
 info "Config       : ${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
 info "Compose      : ${INSTALL_DIR}/${COMPOSE_FILE}"
-info "Image version: ${DOCKER_IMAGE}:${SELECTED_VERSION}"
+info "Dockerfile   : ${INSTALL_DIR}/${DOCKERFILE}"
+info "Source image : ${GHCR_IMAGE}:${SELECTED_VERSION}"
+info "Built image  : ${LOCAL_IMAGE}:${SELECTED_VERSION}  (channel: ${SELECTED_CHANNEL})"
 info "Network      : host mode (no Docker port mapping)"
 info "Listen port  : ${PORT}"
 info "Announce IP  : ${ANNOUNCE_IP}"
@@ -1417,18 +1430,11 @@ echo ""
 # ── proxy links ────────────────────────────────────────────────────────
 info "Users & proxy links:"
 echo ""
-
-# Hex-encode TLS domain for fake-TLS secret (ee prefix)
 domain_hex=$(printf '%s' "${TLS_DOMAIN}" | xxd -p | tr -d '\n')
-
 for u in "${USERS[@]}"; do
   s="${SECRETS[$u]}"
-  # fake-TLS secret format: ee + 32 hex secret + hex-encoded SNI domain
   encoded_secret="ee${s}${domain_hex}"
-
-  # Build tg:// proxy link
   tg_link="tg://proxy?server=${ANNOUNCE_IP}&port=${PORT}&secret=${encoded_secret}"
-
   printf "  ${BOLD}%s${NC}\n" "$u"
   printf "    Secret : %s\n" "$s"
   printf "    Link   : ${CYAN}%s${NC}\n" "$tg_link"
@@ -1437,30 +1443,25 @@ done
 
 # ── management commands ────────────────────────────────────────────────
 header "Management commands"
-
 if [[ "${CREATE_SERVICE,,}" =~ ^y ]]; then
   info "Service     : systemctl {start|stop|restart|status} ${SERVICE_NAME}"
-  info "Reload      : systemctl reload ${SERVICE_NAME}"
+  info "Reload      : systemctl reload ${SERVICE_NAME}   (rebuild + recreate)"
 fi
-if [[ "${AUTO_UPDATE,,}" =~ ^y ]]; then
-  info "Auto-update : systemctl list-timers ${UPDATER_TIMER}.timer"
-fi
+info "Lifecycle   : bash ${INSTALL_DIR}/install-mtproto.sh --{start|stop|restart|status|logs}"
+info "Rebuild     : bash ${INSTALL_DIR}/install-mtproto.sh --rebuild"
 info "Logs        : docker logs telemt --tail=50 -f"
 info "Config      : nano ${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
-info "Restart     : docker compose -f ${INSTALL_DIR}/${COMPOSE_FILE} up -d --force-recreate"
 info "Uninstall   : bash ${INSTALL_DIR}/install-mtproto.sh --uninstall"
 echo ""
 header "Version management"
 info "List versions   : bash ${INSTALL_DIR}/install-mtproto.sh --list-versions"
-info "Switch version  : bash ${INSTALL_DIR}/install-mtproto.sh --set-version [VERSION]"
+info "Switch version  : bash ${INSTALL_DIR}/install-mtproto.sh --set-version [VERSION|latest]"
 info "Update status   : bash ${INSTALL_DIR}/install-mtproto.sh --update-status"
 info "Enable updates  : bash ${INSTALL_DIR}/install-mtproto.sh --update-enable"
 info "Disable updates : bash ${INSTALL_DIR}/install-mtproto.sh --update-disable"
 
-# ── nftables reminder ──────────────────────────────────────────────────
 echo ""
 printf '%b%b⚠  FIREWALL REMINDER:%b\n' "$YELLOW" "$BOLD" "$NC"
 printf '%b   Make sure your nftables config allows traffic on port %s.%b\n' "$YELLOW" "$PORT" "$NC"
-printf '%b   Check: define TELEMT_PORT = %s%b\n' "$YELLOW" "$PORT" "$NC"
 printf '%b   Apply: nft -f /etc/nftables.conf%b\n' "$YELLOW" "$NC"
 echo ""

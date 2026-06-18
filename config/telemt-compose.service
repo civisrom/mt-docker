@@ -1,6 +1,6 @@
 [Unit]
-Description=Telemt MTProto Proxy (Docker Compose)
-Documentation=https://gitlab.com/An0nX/telemt-docker
+Description=Telemt MTProto Proxy (Docker Compose, locally built)
+Documentation=https://github.com/telemt/telemt
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -12,12 +12,14 @@ WorkingDirectory=/opt/telemt
 ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do docker info >/dev/null 2>&1 && break || sleep 3; done'
 # Validate docker-compose.yml configuration
 ExecStartPre=/usr/bin/docker compose config -q
-# Start containers
-ExecStart=/usr/bin/docker compose up -d --wait
-# Reload containers configuration
-ExecReload=/usr/bin/docker compose up -d --force-recreate
+# Build (via the dedicated buildx builder) + start. Delegated to the script so
+# build cache stays isolated (see --uninstall) and falls back to the default
+# builder if the dedicated one is unavailable.
+ExecStart=/opt/telemt/install-mtproto.sh --start
+# Reload: rebuild image + recreate containers
+ExecReload=/opt/telemt/install-mtproto.sh --rebuild
 # Stop containers
-ExecStop=/usr/bin/docker compose down
+ExecStop=/opt/telemt/install-mtproto.sh --stop
 # Show last 50 lines of logs after stop (for debugging)
 ExecStopPost=-/usr/bin/docker compose logs --tail=50
 # Keep service active after start
@@ -25,8 +27,8 @@ RemainAfterExit=yes
 # Restart on failure
 Restart=on-failure
 RestartSec=30
-# Timeouts
-TimeoutStartSec=300
+# Timeouts (build may take a while on first run)
+TimeoutStartSec=600
 TimeoutStopSec=120
 # Logging
 StandardOutput=journal

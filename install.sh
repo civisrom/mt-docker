@@ -40,6 +40,13 @@ detect_distro() {
 # These don't need full bootstrap — just download and run install-mtproto.sh
 _fast_path_commands=(
   "--uninstall"
+  "--rebuild"
+  "--start"
+  "--stop"
+  "--restart"
+  "--status"
+  "--logs"
+  "--auto-update"
   "--list-versions"
   "--set-version"
   "--update-enable"

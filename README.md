@@ -1,6 +1,11 @@
 # mt-docker
 
-Интерактивный скрипт установки MTProto-прокси [telemt-docker](https://gitlab.com/An0nX/telemt-docker).
+Интерактивный установщик MTProto-прокси на базе [telemt/telemt](https://github.com/telemt/telemt).
+
+Контейнер **собирается локально** из официального образа `ghcr.io/telemt/telemt`:
+статический бинарь `telemt` копируется в минимальный alpine-образ — без
+зависимости от сторонних готовых образов и без ручного разбора GitHub Releases.
+Обновление = смена версии + пересборка.
 
 ## Быстрый старт (одна команда)
 
@@ -24,126 +29,132 @@ bash <(curl -fsSL https://raw.githubusercontent.com/civisrom/mt-docker/main/inst
 
 - Linux (Debian/Ubuntu, CentOS/RHEL, Fedora)
 - Root-доступ
+- Docker с поддержкой `docker compose build` (ставится автоматически)
 
-> Все остальные зависимости (Docker, OpenSSL и т.д.) устанавливаются автоматически.
+## Как собирается контейнер
+
+`telemt.dockerfile` — двухстадийная сборка:
+
+```dockerfile
+ARG TELEMT_VERSION=3.4.18
+FROM ghcr.io/telemt/telemt:${TELEMT_VERSION} AS dl   # официальный образ
+FROM alpine:3.21                                     # минимальный runtime
+COPY --from=dl /app/telemt /usr/local/bin/telemt
+# non-root uid 65532 + file-capability cap_net_bind_service на бинаре
+```
+
+Запуск внутри контейнера:
+
+```
+telemt run --data-path /etc/telemt/data /etc/telemt/telemt.toml
+```
+
+Версия задаётся в `/opt/telemt/.env` (`TELEMT_VERSION`) и используется
+одновременно как build-arg и как тег локального образа `civisrom/mt-telemt`.
 
 ## Параметры установки
 
-Скрипт интерактивно запрашивает:
-
 | Параметр | Описание | По умолчанию |
 |----------|----------|--------------|
-| Пользователи | Имена для `show_link` / `[access.users]`; секрет генерируется через `openssl rand -hex 16` | — |
+| Пользователи | Имена для `show_link` / `[access.users]`; секрет `openssl rand -hex 16` | — |
 | Порт сервера | Порт telemt в host mode (реальный порт на хосте) | `443` |
-| Announce IP | Публичный IP сервера (автоопределение через ifconfig.me) | auto-detect |
+| Announce IP | Публичный IP сервера (автоопределение) | auto-detect |
 | TLS-домен | Домен для TLS-маскировки (fake-TLS) | `www.google.com` |
-| Версия образа | Конкретная версия Docker-образа или `latest` | `latest` |
-| Systemd-служба | Создать systemd-юнит для автозапуска | `Y` |
-| Авто-обновление | Ежедневный таймер обновления образа (04:00) | `Y` (при `latest`), `N` (при пиннинге) |
+| Версия | Конкретная версия из GHCR или `latest` (отслеживать новейшую) | `latest` |
+| Systemd-служба | systemd-юнит для автозапуска (сборка при старте) | `Y` |
+| Авто-обновление | Ежедневная пересборка при появлении новой версии (04:00) | `Y` (latest) / `N` (pinned) |
 
 ## Режим работы
 
 Контейнер работает в **host network mode** — без Docker port mapping.
-Порт задаётся в `telemt.toml` секции `[server] port` и является реальным портом на хосте.
+Порт задаётся в `telemt.toml` секции `[server] port` и является реальным
+портом на хосте.
 
 ### Привилегированные порты (<1024)
 
-Upstream-образ запускается от **non-root** пользователя по умолчанию. Скрипт сохраняет этот режим и для порта `443`: в `docker-compose.yml` остаются `no-new-privileges:true`, `cap_drop: ALL` и единственная добавленная capability `NET_BIND_SERVICE`.
+Бинарь запускается non-root пользователем (uid 65532). В `telemt.dockerfile`
+на бинарь вешается file-capability `cap_net_bind_service=+ep`, а в compose —
+`cap_add: NET_BIND_SERVICE` (держит её в bounding set). Это позволяет надёжно
+биндить порт `443` без root.
 
-Если на конкретном хосте с `network_mode: host` ядро всё равно возвращает `Permission denied (os error 13)` для порта ниже `1024`, используйте порт выше `1024` или настройте политику низких портов на хосте. Скрипт больше не переводит контейнер в `root`.
+> `no-new-privileges` намеренно **не включён** в compose: этот флаг отключает
+> применение file-capabilities при `execve`, из-за чего non-root перестаёт
+> биндить `443`. Если используете порт `>1024`, можете включить
+> `no-new-privileges:true` и убрать `cap_add` для максимального hardening.
 
 ### Монтирование конфигурации
 
-Конфигурация монтируется как **директория** (`telemt-config/`), а не как отдельный файл. Это необходимо для поддержки атомарной записи конфигурации (API создаёт `.tmp` файл и переименовывает его).
-
-После установки скрипт генерирует `tg://proxy` ссылки для каждого пользователя с fake-TLS кодированием.
+`telemt-config/` монтируется как директория в `/etc/telemt` (writable):
+там лежат `telemt.toml` и `data/` (replay-кэш, fake-сертификаты). Остальная
+ФС контейнера — `read_only`. Атомарная запись конфига (`.tmp` + rename)
+поддерживается.
 
 ## Создаваемые файлы
 
 | Файл | Расположение |
 |------|--------------|
 | `telemt.toml` | `/opt/telemt/telemt-config/telemt.toml` |
+| `data/` | `/opt/telemt/telemt-config/data/` |
 | `docker-compose.yml` | `/opt/telemt/docker-compose.yml` |
+| `telemt.dockerfile` | `/opt/telemt/telemt.dockerfile` |
+| `.env` | `/opt/telemt/.env` (`TELEMT_VERSION`, `UPDATE_CHANNEL`) |
 | Systemd-служба | `/etc/systemd/system/telemt-compose.service` |
 | Служба обновления | `/etc/systemd/system/telemt-compose-update.service` |
 | Таймер обновления | `/etc/systemd/system/telemt-compose-update.timer` |
 
 ## Управление
 
+Скрипт `install-mtproto.sh` — единая точка управления:
+
 ```bash
-# Служба
+sudo bash /opt/telemt/install-mtproto.sh --start     # docker compose up -d --build
+sudo bash /opt/telemt/install-mtproto.sh --stop      # docker compose down
+sudo bash /opt/telemt/install-mtproto.sh --restart   # пересоздать контейнер
+sudo bash /opt/telemt/install-mtproto.sh --rebuild   # пересобрать образ + пересоздать
+sudo bash /opt/telemt/install-mtproto.sh --status    # статус контейнера/службы
+sudo bash /opt/telemt/install-mtproto.sh --logs      # docker logs -f
+```
+
+Через systemd:
+
+```bash
 sudo systemctl start|stop|restart|status telemt-compose
-
-# Перезапуск с новым конфигом
-sudo systemctl reload telemt-compose
-
-# Логи
+sudo systemctl reload telemt-compose   # пересборка + пересоздание
 sudo docker logs telemt --tail=50 -f
-
-# Ручное обновление образа
-cd /opt/telemt && sudo docker compose pull && sudo docker compose up -d --force-recreate
-
-# Проверить таймер авто-обновления
-sudo systemctl list-timers telemt-compose-update.timer
 ```
 
 ## Управление версиями и обновлениями
 
-### CLI-команды
-
 | Команда | Описание |
 |---------|----------|
-| `--list-versions` | Показать доступные версии из Docker Hub |
-| `--set-version [V]` | Переключиться на версию (интерактивно или напрямую) |
-| `--update-status` | Текущая версия + статус авто-обновлений |
-| `--update-enable` | Создать/обновить systemd unit-файлы и включить авто-обновление |
-| `--update-disable` | Остановить и отключить timer авто-обновления |
-
-Все команды можно запускать как напрямую, так и через bootstrap-скрипт (без повторной установки зависимостей):
-
-```bash
-# Напрямую (если скрипт уже скачан)
-sudo bash install-mtproto.sh --list-versions
-
-# Через bootstrap (скачает скрипт автоматически)
-bash <(curl -fsSL https://raw.githubusercontent.com/civisrom/mt-docker/main/install.sh) --list-versions
-```
-
-### Выбор версии
+| `--list-versions` | Показать доступные версии из GHCR (`ghcr.io/telemt/telemt`) |
+| `--set-version [V]` | Переключиться на версию `V` или `latest` (интерактивно или напрямую) |
+| `--update-status` | Текущая версия, канал и статус авто-обновлений |
+| `--update-enable` | Создать/включить таймер авто-обновления |
+| `--update-disable` | Остановить и отключить таймер |
+| `--auto-update` | Вызывается таймером: резолвит новейшую версию и пересобирает |
 
 ```bash
-# Показать доступные версии
-sudo bash install-mtproto.sh --list-versions
+# показать доступные версии из GHCR
+sudo bash /opt/telemt/install-mtproto.sh --list-versions
 
-# Переключиться интерактивно (покажет список и спросит выбор)
-sudo bash install-mtproto.sh --set-version
+# переключиться на конкретную версию (канал станет pinned)
+sudo bash /opt/telemt/install-mtproto.sh --set-version 3.4.18
 
-# Переключиться на конкретную версию напрямую
-sudo bash install-mtproto.sh --set-version 3.3.27
-
-# Вернуться на latest
-sudo bash install-mtproto.sh --set-version latest
+# вернуться на отслеживание новейшей (канал latest)
+sudo bash /opt/telemt/install-mtproto.sh --set-version latest
 ```
 
-### Управление авто-обновлениями
+### Логика обновлений
 
-```bash
-# Проверить статус (текущая версия, пиннинг, состояние таймера)
-sudo bash install-mtproto.sh --update-status
-
-# Отключить авто-обновление
-sudo bash install-mtproto.sh --update-disable
-
-# Включить авто-обновление
-sudo bash install-mtproto.sh --update-enable
-```
-
-### Умная логика
-
-- **При установке**: если выбрана конкретная версия (не `latest`), авто-обновление по умолчанию **отключается**
-- **При `--set-version`**: если версия запинена и авто-обновление включено — скрипт объяснит, что таймер будет бесполезно тянуть тот же тег, и предложит отключить его
-- **При `--update-enable`**: если версия запинена — скрипт предложит переключиться на `latest`, чтобы обновления действительно работали
-- **Авто-обновление** запускается ежедневно в ~04:00 (с рандомизацией ±30 мин) и тянет тег, указанный в `docker-compose.yml`
+- `.env` хранит `TELEMT_VERSION` (всегда конкретный тег) и `UPDATE_CHANNEL`.
+- `UPDATE_CHANNEL=latest` — авто-обновление резолвит новейший semver-тег из
+  GHCR; если он новее текущего — правит `.env` и **пересобирает** образ
+  (`docker compose build --pull` + `up -d --force-recreate`), старые образы
+  подчищаются.
+- `UPDATE_CHANNEL=pinned` — авто-обновление ничего не меняет (no-op); при
+  пиннинге установщик предлагает отключить таймер.
+- Таймер срабатывает ежедневно в ~04:00 (рандомизация ±30 мин).
 
 ## Удаление
 
@@ -154,5 +165,28 @@ bash <(wget -qO- https://raw.githubusercontent.com/civisrom/mt-docker/main/insta
 или локально:
 
 ```bash
-sudo bash install-mtproto.sh --uninstall
+sudo bash /opt/telemt/install-mtproto.sh --uninstall
 ```
+
+Удаление **безопасное и точечное** — затрагивает только ресурсы telemt:
+
+- контейнер по точному имени `telemt` и по метке `org.civisrom.mt-docker=telemt`
+  (контейнеры других проектов на хосте, напр. rustdesk, не трогаются);
+- локально собранные образы строго `civisrom/mt-telemt:*`;
+- **build-кэш** — через удаление выделенного buildx-builder'а `mt-docker`
+  (`docker buildx rm`). Весь кэш сборки изолирован в этом builder'е, поэтому
+  чистится одной командой, не затрагивая дефолтный builder и кэш других
+  проектов. Глобальный `docker builder prune` **не** запускается;
+- systemd-юниты и каталог `/opt/telemt`.
+
+Базовый образ `ghcr.io/telemt/telemt` намеренно **не удаляется**: он может
+использоваться другими сборками на хосте.
+
+### Почему выделенный builder
+
+Сборка идёт через `docker buildx` builder `mt-docker` (драйвер
+`docker-container`). Это даёт изолированный build-кэш, который можно полностью
+снести при удалении, ничего не задев. Если buildx недоступен или builder не
+создаётся (ограниченный хост) — сборка автоматически откатывается на дефолтный
+builder, а удаление в этом случае не трогает общий кэш (безопасность важнее
+полноты очистки).

@@ -1,6 +1,8 @@
 show_link = []
 
 [general]
+log_level = "normal"
+disable_colors = true
 prefer_ipv6 = false
 fast_mode = true
 use_middle_proxy = false
@@ -31,6 +33,17 @@ tls_domain = "example.com"
 mask = true
 mask_port = 443
 fake_cert_len = 2048
+tls_emulation = true
+tls_new_session_tickets = 0
+mask_shape_hardening = false
+mask_shape_bucket_floor_bytes = 512
+mask_shape_bucket_cap_bytes = 4096
+mask_shape_hardening_aggressive_mode = false
+mask_shape_above_cap_blur = false
+mask_shape_above_cap_blur_max_bytes = 512
+mask_timing_normalization_enabled = false
+mask_timing_normalization_floor_ms = 180
+mask_timing_normalization_ceiling_ms = 320
 
 [access]
 replay_check_len = 65536

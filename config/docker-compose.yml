@@ -1,39 +1,45 @@
 services:
   telemt:
-    image: whn0thacked/telemt-docker:latest
+    # ---------------------------------------------------------------
+    # Образ собирается ЛОКАЛЬНО из telemt.dockerfile, а не тянется готовым
+    # сторонним образом. Тег и build-arg берутся
+    # из .env (TELEMT_VERSION) — обновление = смена версии + пересборка.
+    # ---------------------------------------------------------------
+    build:
+      context: .
+      dockerfile: telemt.dockerfile
+      args:
+        TELEMT_VERSION: ${TELEMT_VERSION:-3.4.18}
+    image: civisrom/mt-telemt:${TELEMT_VERSION:-3.4.18}
     container_name: telemt
     labels:
       org.civisrom.mt-docker: "telemt"
     restart: unless-stopped
-
-    # ---------------------------------------------------------------
-    # The upstream image runs as a non-root user by default.
-    # Keep it non-root; NET_BIND_SERVICE below is used for low ports
-    # such as 443 where the host kernel requires bind privileges.
-    # ---------------------------------------------------------------
+    # No pull_policy: образ собирается явно (install-mtproto.sh / systemd через
+    # выделенный buildx-builder). `compose up` использует уже собранный образ и
+    # не пересобирает его дефолтным builder'ом.
 
     # Telemt uses RUST_LOG for verbosity (optional)
     environment:
       RUST_LOG: "info"
 
     # ---------------------------------------------------------------
-    # API Configuration writes (Atomic Config Save)
-    # The API performs atomic writes (creates a .tmp file and renames it).
-    # To allow the API to save changes to the config, we MUST mount the
-    # ENTIRE directory (not just the file) and ensure it is writable.
-    # We override the default command to point to the mounted file.
+    # telemt run --data-path /etc/telemt/data /etc/telemt/telemt.toml
+    # Конфиг и data-path лежат в смонтированной (writable) директории,
+    # поэтому атомарная запись конфига (.tmp + rename) и replay-кэш
+    # работают, а остальная ФС остаётся read-only.
     # ---------------------------------------------------------------
-    command: ["/etc/telemt/telemt.toml"]
+    command: ["run", "--data-path", "/etc/telemt/data", "/etc/telemt/telemt.toml"]
     volumes:
       - ./telemt-config:/etc/telemt
 
     # ---------------------------------------------------------------
-    # Host network mode: the container uses the host's network stack
-    # directly. The "ports" section is IGNORED in this mode — Telemt
-    # binds to host ports as specified in telemt.toml.
+    # Host network mode: контейнер использует сетевой стек хоста. Секция
+    # "ports" в этом режиме ИГНОРИРУЕТСЯ — telemt биндит порт хоста по
+    # значению [server] port в telemt.toml.
     #
-    # To use Docker-managed port mapping instead, comment out
-    # "network_mode: host" and uncomment the "ports" section below.
+    # Чтобы использовать Docker-маппинг портов, закомментируйте
+    # network_mode: host и раскомментируйте ports ниже.
     # ---------------------------------------------------------------
     network_mode: host
 
@@ -44,11 +50,18 @@ services:
 
     # Hardening
     # ---------------------------------------------------------------
-    # Keep privilege escalation blocked. The only capability retained
-    # is NET_BIND_SERVICE for binding privileged ports.
+    # Сбрасываем все capabilities, кроме NET_BIND_SERVICE — он нужен,
+    # чтобы non-root бинарь (uid 65532) мог биндить привилегированные
+    # порты (<1024, напр. 443). На сам бинарь повешена file-capability
+    # cap_net_bind_service (см. telemt.dockerfile); cap_add держит её
+    # в bounding set контейнера.
+    #
+    # ВАЖНО: no-new-privileges НЕ включаем намеренно — этот флаг
+    # отключает применение file-capabilities при execve, из-за чего
+    # non-root перестаёт биндить 443. Если 443 не нужен (порт >1024) —
+    # можно добавить `security_opt: [no-new-privileges:true]` и убрать
+    # cap_add для максимального hardening.
     # ---------------------------------------------------------------
-    security_opt:
-      - no-new-privileges:true
     cap_drop:
       - ALL
     cap_add:
