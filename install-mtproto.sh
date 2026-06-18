@@ -377,14 +377,25 @@ ensure_builder() {
 }
 
 # Build via the dedicated builder when possible; fall back to the default
-# builder if the dedicated one is unavailable or fails (e.g. cannot pull
-# moby/buildkit on a restricted host). $@ = extra build flags (e.g. --pull).
+# builder if the dedicated one is unavailable, fails, or does not load the
+# image into the local store (some Compose versions don't --load from a
+# docker-container builder). $@ = extra build flags (e.g. --pull).
 compose_build() {
+  local ver img
+  ver=$(get_current_version 2>/dev/null || true)
+  img="${LOCAL_IMAGE}:${ver}"
+
   if ensure_builder; then
     if BUILDX_BUILDER="${BUILDER_NAME}" compose build "$@"; then
-      return 0
+      # Confirm the image actually landed in the local image store; if not,
+      # the default builder (which always loads) is used below.
+      if [[ -z "$ver" ]] || docker image inspect "$img" &>/dev/null; then
+        return 0
+      fi
+      warn "Image ${img} not in local store (builder didn't --load); retrying with default builder."
+    else
+      warn "Build with dedicated builder '${BUILDER_NAME}' failed; retrying with default builder."
     fi
-    warn "Build with dedicated builder '${BUILDER_NAME}' failed; retrying with default builder."
   fi
   compose build "$@"
 }
@@ -415,8 +426,11 @@ remove_builder() {
 prune_old_local_images() {
   local keep="$1"
   local img
+  # Guard: without a concrete version to keep, do nothing (avoid wiping the
+  # image that is currently in use).
+  [[ -z "$keep" ]] && return 0
   docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-    | grep -E "^${LOCAL_IMAGE}:" | grep -v ":${keep}\$" | while IFS= read -r img; do
+    | grep -E "^${LOCAL_IMAGE}:" | grep -vF "${LOCAL_IMAGE}:${keep}" | while IFS= read -r img; do
       docker rmi "$img" 2>/dev/null || true
     done
 }
@@ -578,17 +592,9 @@ cleanup_existing_install() {
   # 4b. Drop the dedicated buildx builder — removes THIS project's build cache
   #     only. The default builder and other projects' caches are untouched.
   #     This is the safe alternative to a global `docker builder prune`.
+  #     (If the build had to fall back to the default builder, its cache is
+  #     shared and intentionally NOT pruned — safety over completeness.)
   remove_builder
-
-  # 4c. As a fallback (build ran on the default builder, e.g. buildx absent),
-  #     reclaim only build-cache records that BuildKit itself marks as
-  #     belonging to the telemt image. We never run an unfiltered/global prune.
-  if command -v docker &>/dev/null && docker buildx version &>/dev/null; then
-    if docker buildx du --filter "description~=${LOCAL_IMAGE}" &>/dev/null; then
-      info "Pruning telemt build-cache records on the default builder …"
-      docker buildx prune -f --filter "description~=${LOCAL_IMAGE}" &>/dev/null || true
-    fi
-  fi
 
   # 6. Remove systemd unit files from disk
   if (( ${#FOUND_SYSTEMD[@]} > 0 )); then
@@ -779,9 +785,17 @@ do_rebuild() {
 
 do_start()   { need_root; require_install; compose_build || { err "Build failed."; exit 1; }; compose up -d; info "Started."; exit 0; }
 do_stop()    { need_root; require_install; compose down; info "Stopped."; exit 0; }
-do_ensure_builder() { need_root; ensure_builder && info "Builder '${BUILDER_NAME}' ready." || warn "Dedicated builder unavailable; default builder will be used."; exit 0; }
+do_ensure_builder() {
+  need_root
+  if ensure_builder; then
+    info "Builder '${BUILDER_NAME}' ready."
+  else
+    warn "Dedicated builder unavailable; default builder will be used."
+  fi
+  exit 0
+}
 do_restart() { need_root; require_install; compose up -d --force-recreate; info "Restarted."; exit 0; }
-do_logs()    { require_install; docker logs telemt --tail=100 -f; exit 0; }
+do_logs()    { require_install; docker logs telemt --tail=100 -f || true; exit 0; }
 
 do_status() {
   require_install
@@ -1297,11 +1311,6 @@ info "Writing ${ENV_FILE} (TELEMT_VERSION=${SELECTED_VERSION}, UPDATE_CHANNEL=${
 set_env_kv "TELEMT_VERSION" "${SELECTED_VERSION}" "${ENV_PATH}"
 set_env_kv "UPDATE_CHANNEL" "${SELECTED_CHANNEL}" "${ENV_PATH}"
 
-# Config + data must be writable by the non-root container user (uid 65532)
-chown -R "${NONROOT_UID}:${NONROOT_GID}" "${INSTALL_DIR}/${CONFIG_DIR}"
-chmod 755 "${INSTALL_DIR}/${CONFIG_DIR}" "${INSTALL_DIR}/${CONFIG_DIR}/data"
-chmod 644 "${INSTALL_DIR}/${CONFIG_DIR}/${CONFIG_FILE}"
-
 # ── patch telemt.toml ──────────────────────────────────────────────────
 info "Configuring ${CONFIG_FILE} …"
 
@@ -1328,6 +1337,13 @@ sed -i "s|^mask_port = .*|mask_port = ${MASK_PORT}|"            "${CONFIG_PATH}"
 sed -i "/^\[access\.users\]$/r ${users_tmp}" "${CONFIG_PATH}"
 rm -f "$users_tmp"
 trap - EXIT
+
+# Config + data must be writable by the non-root container user (uid 65532).
+# Done AFTER sed -i (which rewrites the file as root) so the final file is
+# owned by the container user, enabling in-place and atomic config writes.
+chown -R "${NONROOT_UID}:${NONROOT_GID}" "${INSTALL_DIR}/${CONFIG_DIR}"
+chmod 755 "${INSTALL_DIR}/${CONFIG_DIR}" "${INSTALL_DIR}/${CONFIG_DIR}/data"
+chmod 644 "${CONFIG_PATH}"
 
 if (( PORT < 1024 )); then
   info "Port ${PORT} is privileged (<1024); the built binary carries cap_net_bind_service."

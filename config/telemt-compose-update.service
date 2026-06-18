@@ -7,6 +7,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/telemt
+# Stable HOME so `docker buildx` finds the dedicated builder during rebuilds.
+Environment=HOME=/root
 # Авто-обновление делегировано install-mtproto.sh: оно резолвит новейший
 # тег из GHCR (для UPDATE_CHANNEL=latest), правит .env, пересобирает образ
 # и пересоздаёт контейнер. Для UPDATE_CHANNEL=pinned — no-op.
